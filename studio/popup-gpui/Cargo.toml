@@ -8,5 +8,7 @@ description = "Caret popup prototype built with gpui and gpui-kit"
 [dependencies]
 popup-core.workspace = true
 snip-core.workspace = true
+serde_norway.workspace = true
 gpui-kit = "0.9.1"
 raw-window-handle = "0.6"
+tray-icon = { version = "0.26", default-features = false }

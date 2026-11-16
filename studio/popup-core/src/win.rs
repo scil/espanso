@@ -593,6 +593,31 @@ pub fn show_at(h: Handle, r: Rect) {
     }
 }
 
+/// Moves and sizes `h` (physical pixels) without a change of z-order or
+/// focus. A hidden window stays hidden.
+pub fn move_window(h: Handle, r: Rect) {
+    use windows::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER};
+    unsafe {
+        let _ = SetWindowPos(hwnd(h), None, r.left, r.top, r.width(), r.height(), SWP_NOACTIVATE | SWP_NOZORDER);
+    }
+}
+
+/// The screen rectangle of `h` in physical pixels, frame included.
+pub fn window_rect(h: Handle) -> Option<Rect> {
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+    let mut r = RECT::default();
+    unsafe { GetWindowRect(hwnd(h), &mut r).ok().map(|_| from_rect(r)) }
+}
+
+/// The mouse position in physical pixels.
+pub fn cursor_pos() -> (i32, i32) {
+    let mut p = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut p);
+    }
+    (p.x, p.y)
+}
+
 pub fn hide(h: Handle) {
     use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
     unsafe {
@@ -710,5 +735,52 @@ pub fn process_running(name: &str) -> bool {
         }
         let _ = CloseHandle(snap);
         found
+    }
+}
+
+/// Whether this process runs with administrator rights.
+pub fn is_elevated() -> bool {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return false;
+        }
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut len = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(&mut elevation as *mut _ as *mut _),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut len,
+        )
+        .is_ok();
+        let _ = CloseHandle(token);
+        ok && elevation.TokenIsElevated != 0
+    }
+}
+
+/// Opens a folder in Explorer, or a file in its default program, through
+/// `ShellExecuteW`. The existing Explorer process shows the folder in about
+/// 0.25 s. Starting `explorer.exe <folder>` took about 2.4 s, because the new
+/// process hands the folder to the running Explorer and exits.
+pub fn shell_open(path: &std::path::Path) -> Result<(), String> {
+    use windows::core::{w, HSTRING};
+    use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    unsafe {
+        // ShellExecute needs COM on the calling thread.
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        let r = ShellExecuteW(None, w!("open"), &HSTRING::from(path.as_os_str()), None, None, SW_SHOWNORMAL);
+        // A value above 32 means success.
+        if r.0 as isize > 32 {
+            Ok(())
+        } else {
+            Err(format!("ShellExecuteW failed with code {}", r.0 as isize))
+        }
     }
 }

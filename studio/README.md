@@ -10,7 +10,7 @@ This folder is a separate Cargo workspace. It is not a member of the root espans
 | --- | --- |
 | `snip-core` | Library: list, read, edit and validate snippets. Rust frontends link it. |
 | `snipctl` | Command line tool over `snip-core`. `snipctl serve` speaks JSON-RPC for Go and web frontends. |
-| `popup-core`, `popup-slint`, `popup-gpui` | Caret popup prototypes: a snippet search window that opens next to the text caret. `popup-gpui` also builds `popup-ime`, a resident popup that opens on a typed trigger, like an input method. See [POPUP.md](POPUP.md). |
+| `popup-core`, `popup-slint`, `popup-gpui` | Caret popup prototypes: a snippet search window that opens next to the text caret. `popup-gpui` also builds `snip`, a resident popup that opens on a typed trigger, like an input method. See [POPUP.md](POPUP.md). |
 
 ## Guarantees
 

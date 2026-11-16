@@ -114,6 +114,38 @@ struct Undo {
 
 type States = (RollingMatcherState<'static, i32>, Option<RegexMatcherState>);
 
+/// A plain trigger, for the wait on a trigger that starts a longer one.
+struct Trigger {
+    id: i32,
+    /// In lower case when `case_insensitive`.
+    text: String,
+    case_insensitive: bool,
+}
+
+impl Trigger {
+    fn key(&self, typed: &str) -> String {
+        if self.case_insensitive { typed.to_lowercase() } else { typed.to_string() }
+    }
+
+    fn equals(&self, typed: &str) -> bool {
+        self.text == self.key(typed)
+    }
+
+    fn longer_than(&self, typed: &str) -> bool {
+        let typed = self.key(typed);
+        self.text.len() > typed.len() && self.text.starts_with(&typed)
+    }
+}
+
+/// A typed trigger that is also the start of a longer trigger. It waits for
+/// the next keys: they either continue a longer trigger or expand this one.
+struct Pending {
+    chosen: MatchResult<i32>,
+    app: App,
+    /// Keys typed after the trigger that still fit a longer trigger.
+    extra: String,
+}
+
 pub struct Engine {
     configs: &'static dyn ConfigStore,
     store: &'static dyn MatchStore,
@@ -132,6 +164,9 @@ pub struct Engine {
     renderer: &'static dyn Renderer,
     forms: &'static Forms,
     undo: Option<Undo>,
+    /// Every plain trigger with its match id, in load order.
+    triggers: Vec<Trigger>,
+    pending: Option<Pending>,
 }
 
 impl Engine {
@@ -200,6 +235,18 @@ impl Engine {
         }
 
         let forms: &'static Forms = Box::leak(Box::new(Forms { ask, preview: Mutex::new(None) }));
+        let triggers = all
+            .iter()
+            .filter_map(|m| match &m.cause {
+                MatchCause::Trigger(c) => Some(c.triggers.iter().map(|t| Trigger {
+                    id: m.id,
+                    text: if c.propagate_case { t.to_lowercase() } else { t.clone() },
+                    case_insensitive: c.propagate_case,
+                })),
+                _ => None,
+            })
+            .flatten()
+            .collect();
         Ok(Engine {
             configs,
             store,
@@ -215,6 +262,8 @@ impl Engine {
             renderer: renderer(base, forms),
             forms,
             undo: None,
+            triggers,
+            pending: None,
         })
     }
 
@@ -223,6 +272,15 @@ impl Engine {
         let undo = self.undo.take();
         match input {
             Input::Backspace => {
+                if let Some(mut p) = self.pending.take() {
+                    self.history.pop_back();
+                    // Erasing a key after the trigger keeps it waiting.
+                    // Erasing a trigger character ends the wait.
+                    if p.extra.pop().is_some() {
+                        self.pending = Some(p);
+                    }
+                    return None;
+                }
                 if let Some(u) = undo.filter(|u| u.enabled) {
                     self.history.clear();
                     // The user's Backspace already erased one character.
@@ -238,7 +296,10 @@ impl Engine {
                 None
             }
             Input::Reset => {
+                // The caret moved, so the trigger may no longer be before
+                // it. A waiting trigger does not expand.
                 self.history.clear();
+                self.pending = None;
                 None
             }
             Input::Char(c) => {
@@ -249,11 +310,36 @@ impl Engine {
                     _ => MatchKey::Other,
                 };
                 let results = self.feed(Event::Key { key, chars: Some(c.to_string()) });
-                if results.is_empty() {
-                    None
-                } else {
-                    self.expand(results, &app())
+                let Some(mut p) = self.pending.take() else {
+                    return if results.is_empty() { None } else { self.expand(results, &app()) };
+                };
+                // The matcher dropped its state when the waiting trigger
+                // matched, so the keys after it are compared with the
+                // trigger list here.
+                drop(results);
+                p.extra.push(c);
+                let typed = format!("{}{}", typed_trigger(&p.chosen), p.extra);
+                let active = self.active_ids(&p.app);
+                if let Some(id) = self.triggers.iter().find(|t| t.equals(&typed) && active.contains(&t.id)).map(|t| t.id) {
+                    let left = p.chosen.left_separator.clone();
+                    let chosen = MatchResult {
+                        id,
+                        trigger: format!("{}{typed}", left.as_deref().unwrap_or("")),
+                        left_separator: left,
+                        right_separator: None,
+                        vars: HashMap::new(),
+                    };
+                    if self.extends(&typed, &p.app) {
+                        self.pending = Some(Pending { chosen, app: p.app, extra: String::new() });
+                        return None;
+                    }
+                    return self.finish(chosen, &p.app, "");
                 }
+                if self.extends(&typed, &p.app) {
+                    self.pending = Some(p);
+                    return None;
+                }
+                self.finish(p.chosen, &p.app, &p.extra)
             }
         }
     }
@@ -261,6 +347,7 @@ impl Engine {
     /// Tells the matcher that text went in by other means (the popup). The
     /// next trigger can follow it, as after a word separator.
     pub fn inserted(&mut self) {
+        self.pending = None;
         self.history.clear();
         self.undo = None;
         self.feed(Event::VirtualSeparator);
@@ -294,8 +381,52 @@ impl Engine {
         if others > 0 {
             crate::log::line(&format!("expand: {} other matches for the trigger, took the first", others));
         }
+        if self.extends(typed_trigger(&chosen), app) {
+            crate::log::line(&format!("expand: match {} waits, a longer trigger starts the same", chosen.id));
+            self.pending = Some(Pending { chosen, app: app.clone(), extra: String::new() });
+            return None;
+        }
+        self.finish(chosen, app, "")
+    }
+
+    /// Whether a trigger waits for the next key. If no key comes in time,
+    /// the caller calls [`Engine::flush`].
+    pub fn waiting(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Expands a waiting trigger, with the keys typed after it.
+    pub fn flush(&mut self) -> Option<Expansion> {
+        let p = self.pending.take()?;
+        self.finish(p.chosen, &p.app, &p.extra)
+    }
+
+    /// Whether `typed` is the start of a longer trigger of the active
+    /// configuration. Regex triggers do not count.
+    fn extends(&self, typed: &str, app: &App) -> bool {
+        if !self.triggers.iter().any(|t| t.longer_than(typed)) {
+            return false;
+        }
+        let active = self.active_ids(app);
+        self.triggers.iter().any(|t| t.longer_than(typed) && active.contains(&t.id))
+    }
+
+    /// The ids of the matches of the configuration active in `app`.
+    fn active_ids(&self, app: &App) -> HashSet<i32> {
+        let props = AppProperties { title: app.title.as_deref(), class: None, exec: app.exec.as_deref() };
+        let config = self.configs.active(&props);
+        self.store.query(config.match_paths()).matches.iter().map(|m| m.id).collect()
+    }
+
+    /// Expands a chosen match. `extra` holds keys typed after the trigger:
+    /// they are erased with it and typed again after the text.
+    fn finish(&mut self, chosen: MatchResult<i32>, app: &App, extra: &str) -> Option<Expansion> {
+        let props = AppProperties { title: app.title.as_deref(), class: None, exec: app.exec.as_deref() };
+        let config = self.configs.active(&props);
+        let set = self.store.query(config.match_paths());
         self.history.clear();
         let m = *self.by_id.get(&chosen.id)?;
+        let typed = typed_trigger(&chosen).to_string();
         let body = match self.render(m, Some(&chosen.trigger), chosen.vars, config.as_ref(), &set) {
             Ok(body) => body,
             Err(e) => {
@@ -304,14 +435,15 @@ impl Engine {
             }
         };
         let left = chosen.left_separator.as_deref().map_or(0, |s| s.chars().count());
-        let erase = chosen.trigger.chars().count().saturating_sub(left);
+        let erase = chosen.trigger.chars().count().saturating_sub(left) + extra.chars().count();
         let mut body = body;
         if let Some(right) = &chosen.right_separator {
             body.push_str(right);
         }
+        body.push_str(extra);
         let (text, lefts) = cursor_hint(&body);
         self.undo = (lefts == 0).then(|| Undo {
-            trigger: chosen.trigger.chars().skip(left).collect(),
+            trigger: format!("{typed}{extra}"),
             len: text.chars().count(),
             enabled: config.undo_backspace(),
         });
@@ -333,6 +465,19 @@ impl Engine {
         let body = self.render(m, None, HashMap::new(), config.as_ref(), &set)?;
         let (text, lefts) = cursor_hint(&body);
         Ok(Expansion { erase: 0, text, lefts, method: method_of(m), id })
+    }
+
+    /// Renders the first match with this label, as the popup would. The
+    /// editor's Test button uses it.
+    pub fn render_label(&mut self, label: &str) -> Result<String> {
+        let id = self
+            .all
+            .iter()
+            .find(|m| m.label.as_deref() == Some(label))
+            .map(|m| m.id)
+            .ok_or_else(|| anyhow!("the test snippet did not load"))?;
+        let app = App { exec: None, title: None };
+        Ok(self.render_by_id(id, &app)?.text)
     }
 
     fn render(
@@ -408,6 +553,14 @@ impl Engine {
                 ))
             })
             .collect()
+    }
+}
+
+/// The typed trigger without the word separator before it.
+fn typed_trigger(r: &MatchResult<i32>) -> &str {
+    match r.left_separator.as_deref() {
+        Some(s) => r.trigger.strip_prefix(s).unwrap_or(&r.trigger),
+        None => &r.trigger,
     }
 }
 
@@ -780,6 +933,58 @@ matches:
         assert_eq!(typed_in(&mut e, " :np", notepad.clone()).map(|x| x.text), Some("notepad".into()));
         // The default matches stay valid in the application.
         assert_eq!(typed_in(&mut e, " :hi", notepad).map(|x| x.text), Some("hello".into()));
+    }
+
+    const PREFIX: &str = r#"
+matches:
+  - trigger: ";su"
+    replace: "update "
+  - trigger: ";sun"
+    replace: "uninstall "
+  - trigger: ";suxyz"
+    replace: "long"
+"#;
+
+    #[test]
+    fn longer_trigger_wins_over_its_prefix() {
+        let (mut e, _d) = engine(&[("match/base.yml", PREFIX)]);
+        assert_eq!(typed(&mut e, ";su"), None);
+        assert!(e.waiting());
+        assert_eq!(text(typed(&mut e, "n")), Some((4, "uninstall ".into(), 0)));
+        assert!(!e.waiting());
+    }
+
+    #[test]
+    fn other_key_expands_the_prefix_and_stays() {
+        let (mut e, _d) = engine(&[("match/base.yml", PREFIX)]);
+        assert_eq!(typed(&mut e, ";su"), None);
+        // `a` fits no longer trigger: erase the trigger and `a`, type both.
+        assert_eq!(text(typed(&mut e, "a")), Some((4, "update a".into(), 0)));
+        // `x` and `y` fit `;suxyz`, then `q` does not.
+        assert_eq!(typed(&mut e, " ;suxy"), None);
+        assert_eq!(text(typed(&mut e, "q")), Some((6, "update xyq".into(), 0)));
+    }
+
+    #[test]
+    fn pause_expands_the_prefix() {
+        let (mut e, _d) = engine(&[("match/base.yml", PREFIX)]);
+        typed(&mut e, ";sux");
+        assert_eq!(text(e.flush()), Some((4, "update x".into(), 0)));
+        assert_eq!(e.flush(), None);
+    }
+
+    #[test]
+    fn backspace_and_reset_while_waiting() {
+        let (mut e, _d) = engine(&[("match/base.yml", PREFIX)]);
+        typed(&mut e, ";sux");
+        // Erasing the extra key keeps the wait.
+        e.key(Input::Backspace, App::default);
+        assert!(e.waiting());
+        assert_eq!(text(typed(&mut e, "n")), Some((4, "uninstall ".into(), 0)));
+        typed(&mut e, " ;su");
+        e.key(Input::Reset, App::default);
+        assert!(!e.waiting());
+        assert_eq!(e.flush(), None);
     }
 
     #[test]

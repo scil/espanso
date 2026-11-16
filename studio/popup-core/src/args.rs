@@ -11,7 +11,7 @@ use crate::focus::{Insert, LongText};
 /// - `--exit-after-ms N`: close N ms after the first frame (for benchmarks).
 /// - `--query TEXT`: start with this search text.
 /// - `--base DIR`: espanso folder (else `SNIP_BASE`, else the standard one).
-/// - `--trigger TEXT`: characters that open the resident popup (`popup-ime`).
+/// - `--trigger TEXT`: characters that open the resident popup (`snip`).
 ///   The default is `;;`.
 /// - `--log FILE`: write the resident popup's events to FILE. It records
 ///   no typed text.
@@ -23,6 +23,9 @@ use crate::focus::{Insert, LongText};
 ///   pastes it, hidden from clipboard history. `type` types it.
 /// - `--type-chunk N`, `--type-gap-ms N`: typing sends N characters per
 ///   call (default 1) and waits N ms between calls (default 5).
+/// - `--prefix-wait-ms N`: a typed trigger that is also the start of a longer
+///   trigger waits for the next key. If no key comes in N ms (default 500),
+///   the short trigger expands.
 #[derive(Debug, Clone)]
 pub struct Args {
     pub type_text: bool,
@@ -35,6 +38,7 @@ pub struct Args {
     pub allow_injected: bool,
     pub log: Option<PathBuf>,
     pub insert: Insert,
+    pub prefix_wait: std::time::Duration,
 }
 
 impl Default for Args {
@@ -50,6 +54,7 @@ impl Default for Args {
             allow_injected: false,
             log: None,
             insert: Insert::default(),
+            prefix_wait: std::time::Duration::from_millis(500),
         }
     }
 }
@@ -86,6 +91,11 @@ impl Args {
                 "--type-gap-ms" => {
                     if let Some(n) = it.next().and_then(|v| v.parse().ok()) {
                         out.insert.pace.gap = std::time::Duration::from_millis(n);
+                    }
+                }
+                "--prefix-wait-ms" => {
+                    if let Some(n) = it.next().and_then(|v| v.parse().ok()) {
+                        out.prefix_wait = std::time::Duration::from_millis(n);
                     }
                 }
                 "--trigger" => {

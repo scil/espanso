@@ -12,15 +12,22 @@
 //!
 //! Forms and `choice` variables open a window of their own near the caret
 //! ([`form_view`]). That window takes the focus while the user types.
+//!
+//! A tray icon ([`tray`]) offers pause, reload and other common actions. See
+//! `studio/EDITOR.md`.
 #![windows_subsystem = "windows"]
 
+mod editor;
 mod form_view;
+mod tray;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::{ActiveTheme, Theme};
@@ -42,9 +49,18 @@ const MAX_ROWS: usize = 8;
 const PAD: f32 = 6.0;
 const STATUS_H: f32 = 22.0;
 
-/// The snippets for the popup. The engine thread sets it after it loads the
-/// configuration.
-static ENTRIES: OnceLock<Result<Vec<Entry>, String>> = OnceLock::new();
+/// The snippets for the popup, or the load error. The engine thread sets it
+/// after each load. `None` until the first load ends.
+type Entries = Result<Arc<Vec<Entry>>, String>;
+static ENTRIES: RwLock<Option<Entries>> = RwLock::new(None);
+
+fn entries() -> Option<Entries> {
+    ENTRIES.read().unwrap().clone()
+}
+
+fn set_entries(e: Entries) {
+    *ENTRIES.write().unwrap() = Some(e);
+}
 
 /// Messages to the engine thread.
 enum ToEngine {
@@ -52,46 +68,132 @@ enum ToEngine {
     /// The user picked a snippet in the popup. `erase` is the number of
     /// characters of the popup trigger and keyword before the caret.
     Insert { id: i32, erase: usize },
+    /// Load the configuration again.
+    Reload,
+    /// Ctrl+E or Ctrl+N in the popup: erase the popup trigger and the
+    /// keyword (`erase` characters), then open the editor. The erase comes
+    /// first, while the target application still has the focus.
+    Editor { erase: usize, request: editor::Request },
+}
+
+/// Loads the engine and publishes its snippets. On failure, a loaded list
+/// stays, so a bad edit does not empty the popup.
+fn load_engine(base: &std::path::Path, ui: &Sender<Ui>, shared: &Arc<Shared>) -> Option<Engine> {
+    let ask = UiAsk { ui: ui.clone(), shared: shared.clone() };
+    match Engine::load_with(base, Box::new(ask)) {
+        Ok(engine) => {
+            let entries = engine.entries();
+            let n = entries.len();
+            popup_core::log::line(&format!("engine: {n} matches loaded"));
+            set_entries(Ok(Arc::new(entries)));
+            let _ = ui.send(Ui::Loaded(Ok(n)));
+            Some(engine)
+        }
+        Err(e) => {
+            let e = format!("{e:#}");
+            popup_core::log::line(&format!("engine: cannot load the configuration: {e}"));
+            if !matches!(entries(), Some(Ok(_))) {
+                set_entries(Err(e.clone()));
+            }
+            let _ = ui.send(Ui::Loaded(Err(e)));
+            None
+        }
+    }
 }
 
 /// Owns the expansion engine. espanso numbers its matches with a counter per
 /// thread, so the engine is loaded and used on this one thread.
-fn engine_thread(base: Option<PathBuf>, rx: Receiver<ToEngine>, shared: Arc<Shared>, ui: Sender<Ui>) {
-    let loaded = snip_core::Workspace::open(base)
-        .map_err(|e| e.to_string())
-        .and_then(|ws| {
-            let ask = UiAsk { ui: ui.clone(), shared: shared.clone() };
-            Engine::load_with(ws.base(), Box::new(ask)).map_err(|e| format!("{e:#}"))
-        });
-    let mut engine = match loaded {
-        Ok(engine) => {
-            let entries = engine.entries();
-            popup_core::log::line(&format!("engine: {} matches loaded", entries.len()));
-            let _ = ENTRIES.set(Ok(entries));
-            engine
-        }
+fn engine_thread(
+    base: Option<PathBuf>,
+    prefix_wait: Duration,
+    rx: Receiver<ToEngine>,
+    shared: Arc<Shared>,
+    ui: Sender<Ui>,
+) {
+    let base = match snip_core::Workspace::open(base) {
+        Ok(ws) => ws.base().to_path_buf(),
         Err(e) => {
-            popup_core::log::line(&format!("engine: cannot load the configuration: {e}"));
-            let _ = ENTRIES.set(Err(e));
+            let e = e.to_string();
+            popup_core::log::line(&format!("engine: cannot open the configuration folder: {e}"));
+            set_entries(Err(e.clone()));
+            let _ = ui.send(Ui::Loaded(Err(e)));
             return;
         }
     };
+    let _ = ui.send(Ui::Base(base.clone()));
+    let mut loaded = load_engine(&base, &ui, &shared);
+    // If the first load fails, wait for a reload: the user can fix the file
+    // and pick Reload in the tray menu.
+    let engine = loop {
+        if let Some(engine) = loaded.take() {
+            break engine;
+        }
+        match rx.recv() {
+            Ok(ToEngine::Reload) => loaded = load_engine(&base, &ui, &shared),
+            Ok(_) => {}
+            Err(_) => return,
+        }
+    };
     timing::mark("data-loaded");
+    run_engine(engine, &base, prefix_wait, rx, shared, ui)
+}
+
+fn run_engine(
+    mut engine: Engine,
+    base: &std::path::Path,
+    prefix_wait: Duration,
+    rx: Receiver<ToEngine>,
+    shared: Arc<Shared>,
+    ui: Sender<Ui>,
+) {
     if focus::process_running("espanso.exe") {
         popup_core::log::line("engine: espanso.exe runs too, so triggers may expand twice");
     }
-    for msg in rx {
-        match msg {
-            ToEngine::Key(input) => {
-                let Some(x) = engine.key(input, focus::foreground_app) else { continue };
-                if shared.is_active() {
-                    shared.deactivate();
-                    let _ = ui.send(Ui::Hook(HookEvent::Cancel));
+    let expanded = |x: Expansion| {
+        if shared.is_active() {
+            shared.deactivate();
+            let _ = ui.send(Ui::Hook(HookEvent::Cancel));
+        }
+        // The hook sees the key before the application does. Wait until
+        // the application has the last trigger character.
+        std::thread::sleep(Duration::from_millis(10));
+        perform(&x);
+    };
+    loop {
+        // A trigger that starts a longer trigger waits for the next key. If
+        // none comes in time, it expands.
+        let msg = if engine.waiting() {
+            match rx.recv_timeout(prefix_wait) {
+                Ok(msg) => msg,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if let Some(x) = engine.flush() {
+                        expanded(x);
+                    }
+                    continue;
                 }
-                // The hook sees the key before the application does. Wait
-                // until the application has the last trigger character.
-                std::thread::sleep(Duration::from_millis(10));
-                perform(&x);
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match rx.recv() {
+                Ok(msg) => msg,
+                Err(_) => break,
+            }
+        };
+        match msg {
+            // While paused, the engine forgets what it saw, so a trigger
+            // typed half before the pause never expands after it.
+            ToEngine::Key(_) if shared.is_paused() => {
+                let _ = engine.key(Input::Reset, focus::foreground_app);
+            }
+            ToEngine::Key(input) => {
+                if let Some(x) = engine.key(input, focus::foreground_app) {
+                    expanded(x);
+                }
+            }
+            ToEngine::Reload => {
+                if let Some(e) = load_engine(base, &ui, &shared) {
+                    engine = e;
+                }
             }
             ToEngine::Insert { id, erase } => {
                 match engine.render_by_id(id, &focus::foreground_app()) {
@@ -104,6 +206,12 @@ fn engine_thread(base: Option<PathBuf>, rx: Receiver<ToEngine>, shared: Arc<Shar
                 // The hook stays active until the text is in, so keys typed
                 // meanwhile do not open a new session halfway.
                 shared.deactivate();
+            }
+            ToEngine::Editor { erase, request } => {
+                focus::send_backspaces(erase);
+                engine.inserted();
+                shared.deactivate();
+                let _ = ui.send(Ui::Editor(request));
             }
         }
     }
@@ -173,6 +281,12 @@ enum Ui {
     Hook(HookEvent),
     /// Show a form near the caret and send the answer on `reply`.
     Form { form: Form, caret: Caret, reply: form_view::Reply },
+    /// The espanso configuration folder.
+    Base(PathBuf),
+    /// A load ended: the number of snippets, or the error.
+    Loaded(Result<usize, String>),
+    /// Open the editor. The engine sends it after it erased the typed text.
+    Editor(editor::Request),
 }
 
 /// Turns hook events into UI messages. It looks up the caret for `Open`, so
@@ -242,6 +356,19 @@ struct Popup {
     scroll: ScrollHandle,
     shown: Option<Rect>,
     filled: bool,
+    /// The snippet list that `results` points into. A reload does not
+    /// change it while the popup is open.
+    snap: Option<Arc<Vec<Entry>>>,
+    tray: Option<tray::Tray>,
+    /// The tray tooltip text without the pause state.
+    loaded: String,
+    base: Option<PathBuf>,
+    log: Option<PathBuf>,
+    /// The editor window, if it is open. Opened in `cx.defer`, so it lives
+    /// in a cell.
+    editor: Rc<RefCell<Option<WindowHandle<editor::EditorView>>>>,
+    /// Where the popup was when Ctrl+E or Ctrl+N opened the editor.
+    editor_near: Option<Rect>,
 }
 
 impl Popup {
@@ -285,16 +412,101 @@ impl Popup {
             scroll: ScrollHandle::new(),
             shown: None,
             filled: false,
+            snap: None,
+            tray: match tray::Tray::new(focus::is_elevated()) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    popup_core::log::line(&format!("tray: cannot create the icon: {e}"));
+                    None
+                }
+            },
+            loaded: "loading snippets".into(),
+            base: None,
+            log: args.log.clone(),
+            editor: Rc::new(RefCell::new(None)),
+            editor_near: None,
         }
+    }
+
+    /// Opens the editor window after this update.
+    /// Opens the editor after this update. `near` is the popup rectangle
+    /// for a request from the popup.
+    fn open_editor(&mut self, request: editor::Request, near: Option<Rect>, cx: &mut Context<Self>) -> Result<(), String> {
+        let base = self.base.clone().ok_or("the configuration folder is not known yet")?;
+        let engine = self.engine.clone();
+        let reload: Rc<dyn Fn()> = Rc::new(move || {
+            let _ = engine.send(ToEngine::Reload);
+        });
+        let handle = self.editor.clone();
+        cx.defer(move |cx| editor::open(&mut handle.borrow_mut(), base, reload, request, near, cx));
+        Ok(())
     }
 
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         while let Ok(msg) = self.ui_rx.try_recv() {
             self.handle(msg, window, cx);
         }
-        if self.open && !self.filled && ENTRIES.get().is_some() {
+        if self.open && !self.filled && entries().is_some() {
             self.refresh(cx);
             self.place_and_show();
+        }
+        let actions = self.tray.as_ref().map(|t| t.poll()).unwrap_or_default();
+        for action in actions {
+            self.tray_action(action, cx);
+        }
+    }
+
+    fn tray_action(&mut self, action: tray::Action, cx: &mut Context<Self>) {
+        popup_core::log::line(&format!("tray: {action:?}"));
+        let result = match action {
+            tray::Action::NewSnippet => self.open_editor(editor::Request::New { trigger: None }, None, cx),
+            tray::Action::EditSnippets => self.open_editor(editor::Request::Browse, None, cx),
+            tray::Action::Pause(on) => {
+                self.shared.set_paused(on);
+                if on && self.open {
+                    self.shared.deactivate();
+                    self.hide();
+                }
+                self.show_status();
+                Ok(())
+            }
+            tray::Action::Reload => {
+                let _ = self.engine.send(ToEngine::Reload);
+                Ok(())
+            }
+            tray::Action::OpenFolder => match &self.base {
+                Some(b) => tray::open(b),
+                None => Err("the configuration folder is not known yet".into()),
+            },
+            tray::Action::OpenLog => match &self.log {
+                Some(l) => tray::open(l),
+                None => Err("snip runs without --log".into()),
+            },
+            tray::Action::StartAtSignIn(on) => {
+                let r = tray::set_start_at_sign_in(on);
+                if r.is_err() {
+                    if let Some(t) = &self.tray {
+                        t.set_sign_in_checked(!on);
+                    }
+                }
+                r
+            }
+            tray::Action::RestartAsAdmin => tray::restart_as_admin(),
+            tray::Action::Quit => {
+                cx.quit();
+                Ok(())
+            }
+        };
+        if let Err(e) = result {
+            popup_core::log::line(&format!("tray: {action:?} failed: {e}"));
+        }
+    }
+
+    fn show_status(&mut self) {
+        let paused = self.shared.is_paused();
+        let text = if paused { format!("paused, {}", self.loaded) } else { self.loaded.clone() };
+        if let Some(t) = &mut self.tray {
+            t.set_status(paused, &text);
         }
     }
 
@@ -311,6 +523,7 @@ impl Popup {
                 self.keyword.clear();
                 self.note = None;
                 self.hovered = None;
+                self.snap = None;
                 self.refresh(cx);
                 self.place_and_show();
                 window.on_next_frame(move |_, _| timing::since("open-to-frame", pressed));
@@ -319,6 +532,14 @@ impl Popup {
                 // Open the window after this update: gpui does not open a
                 // window while it updates another one.
                 cx.defer(move |cx| form_view::open(form, caret, reply, cx));
+            }
+            Ui::Base(b) => self.base = Some(b),
+            Ui::Loaded(r) => {
+                self.loaded = match r {
+                    Ok(n) => format!("{n} snippets"),
+                    Err(e) => format!("load error: {e}"),
+                };
+                self.show_status();
             }
             Ui::Hook(ev) if !self.open => {
                 popup_core::log::line(&format!("ui ignored {:?} while closed", kind(&ev)));
@@ -338,6 +559,14 @@ impl Popup {
                 }
             }
             Ui::Hook(HookEvent::Accept { .. }) => self.accept(self.selected, cx),
+            Ui::Hook(HookEvent::Edit) => self.open_from_popup(true),
+            Ui::Hook(HookEvent::New { .. }) => self.open_from_popup(false),
+            Ui::Editor(request) => {
+                let near = self.editor_near.take();
+                if let Err(e) = self.open_editor(request, near, cx) {
+                    popup_core::log::line(&format!("editor: {e}"));
+                }
+            }
             Ui::Hook(HookEvent::Click) => {
                 if let Some(row) = self.hovered {
                     self.accept(row, cx);
@@ -351,10 +580,14 @@ impl Popup {
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        match ENTRIES.get() {
+        // A keyword change keeps the list of the session, so the rows stay
+        // valid. `Ui::Open` clears `snap`, so a new session takes the newest
+        // list.
+        match self.snap.clone().map(Ok).or_else(entries) {
             Some(Ok(entries)) => {
                 self.filled = true;
-                self.results = data::filter(entries, &self.keyword, &self.trigger);
+                self.results = data::filter(&entries, &self.keyword, &self.trigger);
+                self.snap = Some(entries);
             }
             Some(Err(e)) => {
                 self.filled = true;
@@ -400,8 +633,27 @@ impl Popup {
         }
     }
 
+    /// Ctrl+E or Right (`edit`), or Ctrl+N, in the popup. The engine erases the typed
+    /// text and then asks the UI to open the editor.
+    fn open_from_popup(&mut self, edit: bool) {
+        let request = if edit {
+            let entry = self.snap.as_ref().zip(self.results.get(self.selected)).map(|(s, &i)| &s[i]);
+            match entry {
+                Some(e) => editor::Request::Find { trigger: e.trigger.clone(), label: e.label.clone() },
+                None => editor::Request::Browse,
+            }
+        } else {
+            editor::Request::New { trigger: Some(format!("{}{}", self.trigger, self.keyword)) }
+        };
+        popup_core::log::line(&format!("ui editor: edit {edit}"));
+        let erase = self.trigger.chars().count() + self.keyword.chars().count();
+        self.editor_near = self.shown;
+        self.hide();
+        let _ = self.engine.send(ToEngine::Editor { erase, request });
+    }
+
     fn accept(&mut self, row: usize, cx: &mut Context<Self>) {
-        let Some(Ok(entries)) = ENTRIES.get() else {
+        let Some(entries) = self.snap.clone() else {
             popup_core::log::line("ui accept: snippets not loaded");
             return;
         };
@@ -428,10 +680,8 @@ impl Popup {
 impl Render for Popup {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let snips = match ENTRIES.get() {
-            Some(Ok(s)) => Some(s),
-            _ => None,
-        };
+        let snips = self.snap.clone();
+        let snips = snips.as_deref();
         let rows = self.results.iter().enumerate().filter_map(|(row, &i)| {
             let e = &snips?[i];
             let title = if e.label.is_empty() { e.trigger.clone() } else { e.label.clone() };
@@ -502,10 +752,10 @@ impl Render for Popup {
             Some(n) => n.clone(),
             None if snips.is_none() => "Loading snippets…".into(),
             None if self.results.is_empty() => {
-                format!("{}{}   no match   Esc close", self.trigger, self.keyword).into()
+                format!("{}{}   no match   Ctrl+N new snippet   Esc close", self.trigger, self.keyword).into()
             }
             None => format!(
-                "{}{}   {} matches   ↑↓ select   Enter insert   Esc close",
+                "{}{}   {} matches   Enter insert   → edit   Ctrl+N new   Esc close",
                 self.trigger,
                 self.keyword,
                 self.results.len()
@@ -550,6 +800,8 @@ fn kind(ev: &HookEvent) -> &'static str {
         HookEvent::Move(_) => "move",
         HookEvent::Click => "click",
         HookEvent::Accept { .. } => "accept",
+        HookEvent::Edit => "edit",
+        HookEvent::New { .. } => "new",
         HookEvent::Cancel => "cancel",
     }
 }
@@ -569,8 +821,8 @@ fn main() {
     let (ui_tx, ui_rx) = mpsc::channel();
     let (engine_tx, engine_rx) = mpsc::channel();
     {
-        let (base, shared, ui_tx) = (args.base.clone(), shared.clone(), ui_tx.clone());
-        std::thread::spawn(move || engine_thread(base, engine_rx, shared, ui_tx));
+        let (base, wait, shared, ui_tx) = (args.base.clone(), args.prefix_wait, shared.clone(), ui_tx.clone());
+        std::thread::spawn(move || engine_thread(base, wait, engine_rx, shared, ui_tx));
     }
     let keys = engine_tx.clone();
     let on_input: hook::OnInput = Box::new(move |input| {
@@ -579,7 +831,8 @@ fn main() {
     let hook_rx = hook::start(&args.trigger, shared.clone(), args.allow_injected, Some(on_input));
     std::thread::spawn(move || controller(hook_rx, ui_tx));
 
-    gpui_kit::application().run(move |cx| {
+    // The assets hold the icon images of the editor buttons.
+    gpui_kit::application().with_assets(gpui_kit::assets::Assets).run(move |cx| {
         gpui_kit::init(cx);
         Theme::sync_system_appearance(None, cx);
 

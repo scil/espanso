@@ -2,7 +2,7 @@
 
 Status: phase one built on 2026-11-15, not yet used for a day. Forms and `choice` variables built on 2026-11-15. See [Build notes](#build-notes) for what differs from this design and what the tests found.
 
-`popup-ime` grows into the one resident program for daily work. It expands full triggers, as the espanso daemon does, and keeps the `;;` popup. After phase one, you stop espanso and run only this program.
+`snip` grows into the one resident program for daily work. It expands full triggers, as the espanso daemon does, and keeps the `;;` popup. After phase one, you stop espanso and run only this program.
 
 The program reuses three library crates of this repository: `espanso-config` reads the configuration, `espanso-match` finds triggers, and `espanso-render` fills variables. The espanso worker connects these crates through `espanso-engine`. The program does not use `espanso-engine`. It copies the small parts of that glue that it needs.
 
@@ -47,7 +47,7 @@ The program ignores its own injected key presses, as now. espanso no longer runs
 ## Order of the work
 
 1. Add `espanso-match` and `espanso-render` to the studio workspace. Write `expand::Engine` with tests: plain trigger, `left_word`, Backspace in the middle of a trigger, case propagation, cursor hint, a `date` variable, per-application filtering.
-2. Connect it to the hook and the engine thread in `popup-ime`. Test in Notepad with `--allow-injected`.
+2. Connect it to the hook and the engine thread in `snip`. Test in Notepad with `--allow-injected`.
 3. Let the popup render snippets with variables through the same engine.
 4. Run it beside espanso with a test trigger prefix, then ask you to stop espanso and use it for a day.
 
@@ -92,7 +92,7 @@ How it works:
 - The UI opens a new window for each form, below the caret line. If there is no room below, the window opens above the line. The window never covers the caret line. It shows the layout as a sentence, with an input box in place of each field, and below it a preview of the result: the snippet text with the form values filled in.
 - A `choice` or `list` field shows its value as text. When it has the focus, it becomes a filter box. A list of its values then opens at the bottom of the form, like the popup list.
 - Keys: Tab and Shift+Tab move between fields. Enter submits. In a multiline field, Enter adds a line and Ctrl+Enter submits. Up and Down move in the list of a `choice` or `list` field. Esc cancels. If the form window loses the focus to another window, the form is canceled.
-- The keyboard hook ignores all keys while a window of popup-ime has the focus. Otherwise the popup and the expander get the keys typed into the form.
+- The keyboard hook ignores all keys while a window of snip has the focus. Otherwise the popup and the expander get the keys typed into the form.
 
 Build notes for forms:
 
@@ -106,5 +106,19 @@ Tests on 2026-11-15, in Notepad, with keys sent by a test tool:
 - `;;espt` opened the form below the caret line. The preview changed with each typed key. Enter erased the trigger and inserted the text, with the caret at `$|$`.
 - Esc on `:editmatch` closed the form and left the trigger in the text.
 - In `:editmatch`, typing filtered the list of files, and Down moved the selection.
-- You tested `;;scU` by hand in Cmder, with popup-ime and Cmder run as administrator. The form worked, and Chinese typed with an input method went into the field.
+- You tested `;;scU` by hand in Cmder, with snip and Cmder run as administrator. The form worked, and Chinese typed with an input method went into the field.
 - Not tested yet: a `choice` variable, and a form picked in the popup.
+
+## Triggers that start a longer trigger
+
+Added on 2026-11-15. espanso expands a trigger as soon as it is complete. If one trigger is the start of another, for example `;;scu` and `;;scun`, the longer one never expands. A scan of your match files found about 34 such pairs.
+
+snip waits instead:
+
+- When a typed trigger is also the start of a longer trigger of the active configuration, it does not expand at once. Regex triggers do not count.
+- If the next keys make the longer trigger, the longer one expands. If it is also the start of a longer trigger, it waits again.
+- If a key fits no longer trigger, the short trigger expands. The engine erases the trigger and the keys after it, and types the keys again after the text.
+- If no key comes in 500 ms, the short trigger expands. `--prefix-wait-ms` changes this time.
+- Backspace erases a key after the trigger and keeps the wait. A Backspace on the trigger itself, an arrow key or a click ends the wait, and nothing expands.
+
+espanso's matcher drops its state when a trigger matches. So while a trigger waits, the engine compares the typed keys with its own list of triggers. It follows the `propagate_case` setting of each trigger for upper and lower case.

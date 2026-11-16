@@ -13,6 +13,10 @@
 //! - Enter and Tab are swallowed and choose the selection
 //!   ([`HookEvent::Accept`]). With no results they cancel and go through.
 //! - Escape is swallowed and cancels.
+//! - Ctrl+E or Right (with at least one result) and Ctrl+N are swallowed and
+//!   ask to edit the selected snippet ([`HookEvent::Edit`]) or to create one
+//!   ([`HookEvent::New`]). The hook stays active until the UI calls
+//!   [`Shared::deactivate`]. The Ctrl key alone changes nothing.
 //! - Any other key, a key with Ctrl, Alt or Win, or a mouse click outside the
 //!   popup cancels and goes through.
 //! - A mouse click inside the popup is swallowed ([`HookEvent::Click`]).
@@ -57,6 +61,12 @@ pub enum HookEvent {
     /// Enter or Tab with at least one result. The hook stays active until the
     /// UI calls [`Shared::deactivate`].
     Accept { keyword: String },
+    /// Ctrl+E or Right with at least one result: edit the selected snippet. The hook
+    /// stays active until the UI calls [`Shared::deactivate`].
+    Edit,
+    /// Ctrl+N: create a snippet. The hook stays active until the UI calls
+    /// [`Shared::deactivate`].
+    New { keyword: String },
     /// The popup must close.
     Cancel,
 }
@@ -65,11 +75,20 @@ pub enum HookEvent {
 #[derive(Default)]
 pub struct Shared {
     active: AtomicBool,
+    paused: AtomicBool,
     results: AtomicUsize,
     popup: Mutex<Option<Rect>>,
 }
 
 impl Shared {
+    /// While paused, the trigger does not open the popup. The expander
+    /// checks the same flag.
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Relaxed);
+    }
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
+    }
     /// Number of results the popup shows now.
     pub fn set_results(&self, n: usize) {
         self.results.store(n, Ordering::Relaxed);
@@ -128,11 +147,16 @@ pub enum Key {
     Backspace,
     Up,
     Down,
+    Right,
     Enter,
     Tab,
     Escape,
     /// Shift or Caps Lock alone. They never change the state.
     Modifier,
+    /// The Ctrl key alone. It starts a shortcut such as Ctrl+E.
+    Ctrl,
+    /// Ctrl with a letter key, and no Alt or Win. The letter is lowercase.
+    CtrlLetter(char),
     /// Any other key, or any key with Ctrl, Alt or Win.
     Other,
 }
@@ -206,8 +230,10 @@ impl Machine {
             (_, Key::Backspace) => Some(Input::Backspace),
             (_, Key::Enter) => Some(Input::Char('\n')),
             (_, Key::Tab) => Some(Input::Char('\t')),
-            (_, Key::Modifier) => None,
-            (_, Key::Up | Key::Down | Key::Escape | Key::Other) => Some(Input::Reset),
+            (_, Key::Modifier | Key::Ctrl) => None,
+            (_, Key::Up | Key::Down | Key::Right | Key::Escape | Key::Other | Key::CtrlLetter(_)) => {
+                Some(Input::Reset)
+            }
         };
         if let Some(input) = input {
             self.pass_on(input);
@@ -238,7 +264,7 @@ impl Machine {
                 if self.recent.len() > n {
                     self.recent.drain(..self.recent.len() - n);
                 }
-                if n > 0 && self.recent == self.trigger {
+                if n > 0 && self.recent == self.trigger && !self.shared.is_paused() {
                     self.recent.clear();
                     self.keyword.clear();
                     self.active = true;
@@ -251,7 +277,7 @@ impl Machine {
             Key::Backspace => {
                 self.recent.pop();
             }
-            Key::Modifier => {}
+            Key::Modifier | Key::Ctrl => {}
             _ => self.recent.clear(),
         }
     }
@@ -295,7 +321,25 @@ impl Machine {
                 self.cancel("escape");
                 Verdict::Swallow
             }
-            Key::Modifier => Verdict::Pass,
+            Key::Modifier | Key::Ctrl => Verdict::Pass,
+            Key::CtrlLetter('e') | Key::Right if self.shared.results.load(Ordering::Relaxed) > 0 => {
+                crate::log::line("hook edit");
+                self.emit(HookEvent::Edit);
+                Verdict::Swallow
+            }
+            Key::CtrlLetter('n') => {
+                crate::log::line("hook new");
+                self.emit(HookEvent::New { keyword: self.keyword.clone() });
+                Verdict::Swallow
+            }
+            Key::CtrlLetter(_) => {
+                self.cancel("ctrl shortcut");
+                Verdict::Pass
+            }
+            Key::Right => {
+                self.cancel("right with no results");
+                Verdict::Pass
+            }
             Key::Other => {
                 self.cancel("other key or chord");
                 Verdict::Pass
@@ -348,7 +392,7 @@ mod win {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, GetKeyState, GetKeyboardLayout, ToUnicodeEx, VK_BACK, VK_CAPITAL,
         VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_PACKET,
-        VK_RCONTROL, VK_RETURN, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_TAB, VK_UP,
+        VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_TAB, VK_UP,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW,
@@ -500,17 +544,23 @@ mod win {
         if [VK_SHIFT, VK_LSHIFT, VK_RSHIFT, VK_CAPITAL].iter().any(|k| is(*k)) {
             return Key::Modifier;
         }
+        let (ctrl, alt) = (down(VK_CONTROL.0 as i32), down(VK_MENU.0 as i32));
+        let win = down(VK_LWIN.0 as i32) || down(VK_RWIN.0 as i32);
+        if [VK_CONTROL, VK_LCONTROL, VK_RCONTROL].iter().any(|k| is(*k)) && !alt && !win {
+            return Key::Ctrl;
+        }
         if [VK_CONTROL, VK_LCONTROL, VK_RCONTROL, VK_MENU, VK_LMENU, VK_RMENU, VK_LWIN, VK_RWIN]
             .iter()
             .any(|k| is(*k))
         {
             return Key::Other;
         }
-        let chord = down(VK_CONTROL.0 as i32)
-            || down(VK_MENU.0 as i32)
-            || down(VK_LWIN.0 as i32)
-            || down(VK_RWIN.0 as i32);
-        if chord {
+        // Ctrl with a letter: the virtual key codes of A to Z are their
+        // ASCII codes.
+        if ctrl && !alt && !win && (0x41..=0x5A).contains(&vk) {
+            return Key::CtrlLetter((vk as u8 + 32) as char);
+        }
+        if ctrl || alt || win {
             return Key::Other;
         }
         if is(VK_BACK) {
@@ -521,6 +571,9 @@ mod win {
         }
         if is(VK_DOWN) {
             return Key::Down;
+        }
+        if is(VK_RIGHT) {
+            return Key::Right;
         }
         if is(VK_RETURN) {
             return Key::Enter;
@@ -599,6 +652,17 @@ mod tests {
     }
 
     #[test]
+    fn paused_trigger_does_not_open() {
+        let (mut m, rx, shared) = machine();
+        shared.set_paused(true);
+        typed(&mut m, "//si");
+        assert_eq!(events(&rx), vec![]);
+        shared.set_paused(false);
+        typed(&mut m, "//");
+        assert_eq!(events(&rx), vec![HookEvent::Open]);
+    }
+
+    #[test]
     fn navigation_keys_are_swallowed() {
         let (mut m, rx, shared) = machine();
         typed(&mut m, "//x");
@@ -609,6 +673,38 @@ mod tests {
         let ev = events(&rx);
         assert_eq!(ev[ev.len() - 1], HookEvent::Accept { keyword: "x".into() });
         assert_eq!(ev[ev.len() - 2], HookEvent::Move(1));
+    }
+
+    #[test]
+    fn ctrl_e_and_ctrl_n_are_swallowed() {
+        let (mut m, rx, shared) = machine();
+        typed(&mut m, "//si");
+        assert_eq!(m.key(Key::Ctrl), Verdict::Pass);
+        // Ctrl+E needs a result.
+        assert_eq!(m.key(Key::CtrlLetter('e')), Verdict::Pass);
+        assert_eq!(events(&rx).last(), Some(&HookEvent::Cancel));
+        typed(&mut m, "//si");
+        shared.set_results(2);
+        assert_eq!(m.key(Key::Ctrl), Verdict::Pass);
+        assert_eq!(m.key(Key::CtrlLetter('e')), Verdict::Swallow);
+        assert_eq!(events(&rx).last(), Some(&HookEvent::Edit));
+        assert_eq!(m.key(Key::CtrlLetter('n')), Verdict::Swallow);
+        assert_eq!(events(&rx).last(), Some(&HookEvent::New { keyword: "si".into() }));
+        assert_eq!(m.key(Key::CtrlLetter('c')), Verdict::Pass);
+        assert_eq!(events(&rx).last(), Some(&HookEvent::Cancel));
+    }
+
+    #[test]
+    fn right_edits_with_results_and_passes_without() {
+        let (mut m, rx, shared) = machine();
+        typed(&mut m, "//si");
+        shared.set_results(1);
+        assert_eq!(m.key(Key::Right), Verdict::Swallow);
+        assert_eq!(events(&rx).last(), Some(&HookEvent::Edit));
+        let (mut m, rx, _) = machine();
+        typed(&mut m, "//zz");
+        assert_eq!(m.key(Key::Right), Verdict::Pass);
+        assert_eq!(events(&rx).last(), Some(&HookEvent::Cancel));
     }
 
     #[test]

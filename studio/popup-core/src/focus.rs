@@ -177,6 +177,40 @@ pub fn show_at(h: Handle, r: crate::Rect) {
     let _ = (h, r);
 }
 
+/// Moves and sizes `h` (physical pixels) without a change of z-order or
+/// focus. A hidden window stays hidden.
+pub fn move_window(h: Handle, r: crate::Rect) {
+    #[cfg(windows)]
+    crate::win::move_window(h, r);
+    #[cfg(not(windows))]
+    let _ = (h, r);
+}
+
+/// The screen rectangle of `h` in physical pixels, frame included.
+pub fn window_rect(h: Handle) -> Option<crate::Rect> {
+    #[cfg(windows)]
+    {
+        crate::win::window_rect(h)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = h;
+        None
+    }
+}
+
+/// The mouse position in physical pixels.
+pub fn cursor_pos() -> (i32, i32) {
+    #[cfg(windows)]
+    {
+        crate::win::cursor_pos()
+    }
+    #[cfg(not(windows))]
+    {
+        (0, 0)
+    }
+}
+
 /// Hides `h`.
 pub fn hide(h: Handle) {
     #[cfg(windows)]
@@ -248,5 +282,29 @@ pub fn foreground_exe() -> Option<String> {
     #[cfg(not(windows))]
     {
         None
+    }
+}
+
+/// Whether this process runs with administrator rights.
+pub fn is_elevated() -> bool {
+    #[cfg(windows)]
+    {
+        crate::win::is_elevated()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Opens a folder in the file manager, or a file in its default program.
+pub fn shell_open(path: &std::path::Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        crate::win::shell_open(path)
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("xdg-open").arg(path).spawn().map(|_| ()).map_err(|e| e.to_string())
     }
 }
