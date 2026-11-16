@@ -38,7 +38,7 @@ Build notes for step 4:
 - Right also edits the selected snippet, like Ctrl+E. Both need at least one result. With no result, Right closes the popup and goes to the application. Ctrl with another letter closes the popup, and the key goes to the application.
 - The engine thread erases the text with Backspaces first, and then it asks the UI to open the editor. So the Backspaces go to the target application, not to the editor.
 - From the popup, the editor opens compact: no list, 760 by 780 logical pixels, with its top left corner where the popup was, on the same monitor. The window stays hidden until it is in place. "Show list" and Ctrl+F bring the list back. From the tray, the editor opens with the list, in the middle of the main monitor.
-- The popup knows a snippet only by its triggers and label, not by its file. The editor opens the first snippet in the files with the same triggers, and with the same label if one matches.
+- The popup knows a snippet only by its triggers and label, not by its file. The editor opens the first snippet in the files with the same triggers, and with the same label if one matches. The popup joins several triggers with two spaces, and the editor compares them the same way. If no snippet matches, the editor shows the list, searched for the first trigger.
 
 `snip` replaces the espanso daemon for daily work (see [EXPANDER.md](EXPANDER.md)). This design adds three parts to it:
 

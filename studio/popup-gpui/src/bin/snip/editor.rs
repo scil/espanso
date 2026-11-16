@@ -202,6 +202,8 @@ pub struct EditorView {
     title: String,
     list_scroll: ScrollHandle,
     form_scroll: ScrollHandle,
+    /// The focus of the window itself, for keys when no box has the focus.
+    focus: FocusHandle,
     _subs: Vec<Subscription>,
 }
 
@@ -270,6 +272,7 @@ impl EditorView {
             title: String::new(),
             list_scroll: ScrollHandle::new(),
             form_scroll: ScrollHandle::new(),
+            focus: cx.focus_handle(),
             _subs: subs,
         };
         // The close button of the title bar asks first, like Esc.
@@ -427,7 +430,8 @@ impl EditorView {
             Request::Find { trigger, label } => {
                 // The list may be older than the engine's snippets.
                 self.refresh_list(cx);
-                let same = |s: &Snippet| s.triggers.join(" ") == trigger || s.regex.as_deref() == Some(trigger.as_str());
+                // The popup joins several triggers with two spaces.
+                let same = |s: &Snippet| s.triggers.join("  ") == trigger || s.regex.as_deref() == Some(trigger.as_str());
                 let found = self
                     .all
                     .iter()
@@ -436,7 +440,17 @@ impl EditorView {
                     .map(|s| (s.file.clone(), s.index));
                 match found {
                     Some((file, index)) => self.open_snippet(&file, index, window, cx),
-                    None => self.set_status(format!("No snippet in the files has the trigger {trigger}."), true),
+                    None => {
+                        // Show the list, searched for the first trigger, so
+                        // the user can pick the snippet by hand.
+                        if self.compact {
+                            self.toggle_list(window, cx);
+                        }
+                        let first = trigger.split_whitespace().next().unwrap_or("").to_string();
+                        self.search.update(cx, |s, cx| s.set_value(first, window, cx));
+                        self.filter(cx);
+                        self.set_status(format!("No snippet in the files has the trigger {trigger}. Pick it in the list."), true);
+                    }
                 }
             }
             Request::New { trigger } => {
@@ -465,7 +479,10 @@ impl EditorView {
         self.confirm_close = false;
         match &self.inputs {
             Some(inputs) => inputs.body.update(cx, |s, cx| s.focus(window, cx)),
-            None => self.search.update(cx, |s, cx| s.focus(window, cx)),
+            None if !self.compact => self.search.update(cx, |s, cx| s.focus(window, cx)),
+            // The search box is hidden. The window itself takes the keys,
+            // so Esc still closes it.
+            None => window.focus(&self.focus, cx),
         }
         cx.notify();
     }
@@ -1581,6 +1598,7 @@ impl Render for EditorView {
             .flex()
             .bg(theme.background)
             .text_color(theme.foreground)
+            .track_focus(&self.focus)
             .capture_key_down(cx.listener(Self::on_key))
             .on_key_down(cx.listener(Self::on_escape))
             .when(!self.compact, |d| d.child(self.render_list(&theme, cx)))
