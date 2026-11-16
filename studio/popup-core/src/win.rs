@@ -279,6 +279,14 @@ pub fn foreground() -> Option<Handle> {
     (!h.is_invalid()).then_some(Handle(h.0 as isize))
 }
 
+pub fn is_own(h: Handle) -> bool {
+    let mut pid = 0u32;
+    unsafe {
+        GetWindowThreadProcessId(hwnd(h), Some(&mut pid));
+    }
+    pid == unsafe { GetCurrentProcessId() }
+}
+
 pub fn own_window() -> Option<Handle> {
     unsafe extern "system" fn each(h: HWND, out: LPARAM) -> BOOL {
         let mut pid = 0u32;

@@ -19,6 +19,19 @@ pub fn foreground() -> Option<Handle> {
     }
 }
 
+/// Whether `h` is a window of this process.
+pub fn is_own(h: Handle) -> bool {
+    #[cfg(windows)]
+    {
+        crate::win::is_own(h)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = h;
+        false
+    }
+}
+
 /// The first visible top-level window of this process. Call it on the UI
 /// thread after the framework shows its window.
 pub fn own_window() -> Option<Handle> {

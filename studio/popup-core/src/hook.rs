@@ -29,6 +29,9 @@
 //! [`start`]. A key that the popup swallows reaches the expander as
 //! [`Input::Reset`], because the application never got it.
 //!
+//! While a window of this process has the focus (a form), the hook ignores
+//! all input, because the user types into that window.
+//!
 //! The hook sees every key press. It keeps only the last few characters and
 //! the current keyword in memory, and it logs nothing.
 
@@ -382,10 +385,21 @@ mod win {
         }
     }
 
-    /// Whether the hook handles an input event.
+    /// Whether the hook handles an input event. It ignores input to a window
+    /// of this process, such as a form, which the user types into.
     fn wanted(injected: bool, extra: usize) -> bool {
         extra != super::OWN_INPUT
             && (!injected || super::ALLOW_INJECTED.load(std::sync::atomic::Ordering::Relaxed))
+            && !own_foreground()
+    }
+
+    /// Whether a window of this process has the focus.
+    fn own_foreground() -> bool {
+        let mut pid = 0u32;
+        unsafe {
+            GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut pid));
+            pid == windows::Win32::System::Threading::GetCurrentProcessId()
+        }
     }
 
     fn down(vk: i32) -> bool {

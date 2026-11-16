@@ -1,6 +1,6 @@
 # Expander design, phase one
 
-Status: phase one built on 2026-11-15, not yet used for a day. See [Build notes](#build-notes) for what differs from this design and what the tests found.
+Status: phase one built on 2026-11-15, not yet used for a day. Forms and `choice` variables built on 2026-11-15. See [Build notes](#build-notes) for what differs from this design and what the tests found.
 
 `popup-ime` grows into the one resident program for daily work. It expands full triggers, as the espanso daemon does, and keeps the `;;` popup. After phase one, you stop espanso and run only this program.
 
@@ -26,7 +26,7 @@ The program reuses three library crates of this repository: `espanso-config` rea
 | Markdown and HTML snippets | Not planned. No snippet uses them. |
 | espanso's application patches (Brave, OneNote, VS Code) | Not planned. They only change espanso's injection timing. |
 
-A snippet with a form or a `choice` variable shows the `espanso` badge in phase one. If you type its trigger, the program logs it and does nothing.
+In phase one, a snippet with a form or a `choice` variable did nothing. The form window replaced that on 2026-11-15.
 
 ## Parts
 
@@ -64,7 +64,7 @@ Differences from the design:
 - If more than one match is valid for a trigger, the engine takes the first one and writes a log line. The popup does not open with those matches.
 - The hook passes each key press to the engine through a callback of `hook::start`. A key that the popup swallows (Up, Down, Enter on a result) reaches the engine as a reset, because the application never got it. Injected input from another program also resets the engine.
 - Tab is now its own key in the hook. In the popup, it still picks the selected result, like Enter.
-- In the popup, a snippet with a form, a `choice` variable or an image shows a `form` badge. Enter on it shows a note and inserts nothing.
+- In the popup, a snippet with an image shows an `image` badge. Enter on it shows a note and inserts nothing.
 
 Tests on 2026-11-15, in the Windows 11 Notepad, with keys sent by a test tool and `--allow-injected`:
 
@@ -74,3 +74,37 @@ Tests on 2026-11-15, in the Windows 11 Notepad, with keys sent by a test tool an
 - With fast keys, Notepad dropped and repeated characters. This also happened with 8 Backspaces in one `SendInput` call, which erased text before the trigger. Typing and the Backspace and Left presses now go one key per call with 5 ms pauses, and a pause after the last Backspace. After this change, the expanded text was correct. The test tool's own fast keys were still dropped at times, and the undo test once erased one character too many.
 
 Next: you type by hand for a day with espanso stopped. Then decide whether the pace needs to change.
+
+## Forms and choice variables, phase two
+
+A form opens near the caret, so you see the text around the place where the result goes.
+
+Decisions, agreed on 2026-11-15:
+
+- The form window takes the keyboard focus, so an input method (IME) works in it, for example for Chinese. After Submit or Cancel, the focus goes back to the window that had it.
+- The trigger stays in the text while the form is open. Submit erases it and inserts the result. Cancel leaves the text as it was.
+
+How it works:
+
+- espanso's `FormExtension` and `ChoiceExtension` call a provider while they render. The new module `popup_core::form` turns their parameters into a `Form`: the layout split into text parts and `[[field]]` parts, and the fields in layout order. It copies espanso's `convert_fields`. A field has the type `text`, `choice` or `list`, and a `default`. A `text` field can be `multiline`. A `choice` or `list` field has `values`: a list, or a string split into lines, trimmed, without empty lines. A field that has no entry in `fields` is a single-line text field.
+- A `choice` variable becomes a form with one `choice` field and no text parts. The provider returns the `id` of the chosen value.
+- The engine thread renders, so the provider runs there. It records the foreground window, finds the caret, sends the form to the UI thread and waits for the answer. After the answer, it gives the focus back to the recorded window. Then the render goes on, and the engine erases the trigger and inserts the text as for any expansion.
+- The UI opens a new window for each form, below the caret line. If there is no room below, the window opens above the line. The window never covers the caret line. It shows the layout as a sentence, with an input box in place of each field, and below it a preview of the result: the snippet text with the form values filled in.
+- A `choice` or `list` field shows its value as text. When it has the focus, it becomes a filter box. A list of its values then opens at the bottom of the form, like the popup list.
+- Keys: Tab and Shift+Tab move between fields. Enter submits. In a multiline field, Enter adds a line and Ctrl+Enter submits. Up and Down move in the list of a `choice` or `list` field. Esc cancels. If the form window loses the focus to another window, the form is canceled.
+- The keyboard hook ignores all keys while a window of popup-ime has the focus. Otherwise the popup and the expander get the keys typed into the form.
+
+Build notes for forms:
+
+- A `list` field and a `choice` field look the same. espanso shows `list` as a list box and `choice` as a drop-down list, and both pick one value.
+- If the snippet text uses a form value, for example `{{form1.app}}`, the form shows a preview. Otherwise it shows none. The `:editmatch` snippet passes the value to a `shell` variable, so its form has no preview.
+- If a form ends because another window took the focus, the focus stays with that window.
+- If the session already ended, the popup ignores a late `Open` message. Before this change, the popup opened under a form that started from a `;;` trigger.
+
+Tests on 2026-11-15, in Notepad, with keys sent by a test tool:
+
+- `;;espt` opened the form below the caret line. The preview changed with each typed key. Enter erased the trigger and inserted the text, with the caret at `$|$`.
+- Esc on `:editmatch` closed the form and left the trigger in the text.
+- In `:editmatch`, typing filtered the list of files, and Down moved the selection.
+- You tested `;;scU` by hand in Cmder, with popup-ime and Cmder run as administrator. The form worked, and Chinese typed with an input method went into the field.
+- Not tested yet: a `choice` variable, and a form picked in the popup.

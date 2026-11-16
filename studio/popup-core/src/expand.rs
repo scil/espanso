@@ -16,6 +16,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
+use std::sync::Mutex;
 
 use anyhow::{anyhow, Result};
 use espanso_config::config::{AppProperties, Config, ConfigStore};
@@ -40,6 +41,23 @@ use espanso_render::{
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::data::Entry;
+use crate::form::{Form, Preview};
+
+/// Shows a form to the user and waits for the answer. The engine calls it
+/// on its own thread, while it renders a snippet.
+pub trait Ask {
+    /// The typed values by field name, or `None` if the user canceled.
+    fn ask(&self, form: Form) -> Option<HashMap<String, String>>;
+}
+
+/// Cancels every form, for tests and for callers without a UI.
+pub struct NoAsk;
+
+impl Ask for NoAsk {
+    fn ask(&self, _: Form) -> Option<HashMap<String, String>> {
+        None
+    }
+}
 
 /// A key press as the engine sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,13 +130,19 @@ pub struct Engine {
     global_vars: &'static HashMap<i32, Variable>,
     contexts: HashMap<i32, Context<'static>>,
     renderer: &'static dyn Renderer,
+    forms: &'static Forms,
     undo: Option<Undo>,
 }
 
 impl Engine {
     /// Loads the espanso configuration in `base` (the folder that holds
-    /// `config` and `match`).
+    /// `config` and `match`). Forms are canceled.
     pub fn load(base: &Path) -> Result<Engine> {
+        Engine::load_with(base, Box::new(NoAsk))
+    }
+
+    /// Loads the configuration. `ask` shows forms and choice lists.
+    pub fn load_with(base: &Path, ask: Box<dyn Ask>) -> Result<Engine> {
         let (configs, store, errors) = espanso_config::load(base)?;
         for set in &errors {
             for e in &set.errors {
@@ -175,6 +199,7 @@ impl Engine {
             }
         }
 
+        let forms: &'static Forms = Box::leak(Box::new(Forms { ask, preview: Mutex::new(None) }));
         Ok(Engine {
             configs,
             store,
@@ -187,7 +212,8 @@ impl Engine {
             templates: Box::leak(Box::new(templates)),
             global_vars: Box::leak(Box::new(global_vars)),
             contexts: HashMap::new(),
-            renderer: renderer(base),
+            renderer: renderer(base, forms),
+            forms,
             undo: None,
         })
     }
@@ -346,6 +372,10 @@ impl Engine {
             }
             &augmented
         };
+        let form_vars: Vec<String> =
+            template.vars.iter().filter(|v| v.var_type == "form").map(|v| v.name.clone()).collect();
+        *self.forms.preview.lock().unwrap() =
+            Some(Preview { body: template.body.clone(), vars: form_vars });
         match self.renderer.render(template, context, &options) {
             RenderResult::Success(body) => Ok(body),
             RenderResult::Aborted => Err(anyhow!("aborted")),
@@ -364,10 +394,7 @@ impl Engine {
                     MatchCause::None => return None,
                 };
                 let (text, insertable) = match &m.effect {
-                    MatchEffect::Text(t) => (
-                        t.replace.clone(),
-                        !t.vars.iter().any(|v| v.var_type == "form" || v.var_type == "choice"),
-                    ),
+                    MatchEffect::Text(t) => (t.replace.clone(), true),
                     MatchEffect::Image(i) => (i.path.clone(), false),
                     MatchEffect::None => return None,
                 };
@@ -497,24 +524,43 @@ impl ClipboardProvider for ClipboardText {
     }
 }
 
-/// Forms and choice variables come in phase two.
-struct NoForms;
+/// The form and choice provider of the renderer. It passes each form to
+/// [`Ask`].
+struct Forms {
+    ask: Box<dyn Ask>,
+    /// The text of the snippet being rendered, for the form preview.
+    preview: Mutex<Option<Preview>>,
+}
 
-impl FormProvider for NoForms {
-    fn show(&self, _: &str, _: &Params, _: &Params) -> FormProviderResult {
-        FormProviderResult::Error(anyhow!("forms are not supported yet"))
+impl FormProvider for Forms {
+    fn show(&self, layout: &str, fields: &Params, _: &Params) -> FormProviderResult {
+        let mut form = Form::from_espanso(layout, fields);
+        form.preview = self.preview.lock().unwrap().clone();
+        match self.ask.ask(form) {
+            Some(values) => FormProviderResult::Success(values),
+            None => FormProviderResult::Aborted,
+        }
     }
 }
 
-impl ChoiceSelector for NoForms {
-    fn show(&self, _: &[Choice]) -> ChoiceSelectorResult {
-        ChoiceSelectorResult::Error(anyhow!("choice variables are not supported yet"))
+impl ChoiceSelector for Forms {
+    fn show(&self, choices: &[Choice]) -> ChoiceSelectorResult {
+        let labels: Vec<String> = choices.iter().map(|c| c.label.to_string()).collect();
+        let picked = self
+            .ask
+            .ask(Form::choice(labels))
+            .and_then(|mut v| v.remove(crate::form::CHOICE_FIELD))
+            .and_then(|label| choices.iter().find(|c| c.label == label));
+        match picked {
+            Some(c) => ChoiceSelectorResult::Success(c.id.to_string()),
+            None => ChoiceSelectorResult::Aborted,
+        }
     }
 }
 
 /// The renderer with espanso's extensions. `base` is espanso's config
 /// folder: `%CONFIG%` in scripts and the working folder of shell commands.
-fn renderer(base: &Path) -> &'static dyn Renderer {
+fn renderer(base: &Path, forms: &'static Forms) -> &'static dyn Renderer {
     use espanso_render::extension::{
         choice::ChoiceExtension, clipboard::ClipboardExtension, date::DateExtension,
         date::DefaultLocaleProvider, echo::EchoExtension, form::FormExtension,
@@ -533,8 +579,8 @@ fn renderer(base: &Path) -> &'static dyn Renderer {
         Box::leak(Box::new(RandomExtension::new())),
         Box::leak(Box::new(ScriptExtension::new(base, &home, &packages))),
         Box::leak(Box::new(ShellExtension::new(base))),
-        Box::leak(Box::new(FormExtension::new(&NoForms))),
-        Box::leak(Box::new(ChoiceExtension::new(&NoForms))),
+        Box::leak(Box::new(FormExtension::new(forms))),
+        Box::leak(Box::new(ChoiceExtension::new(forms))),
     ];
     Box::leak(Box::new(espanso_render::create(extensions)))
 }
@@ -655,12 +701,56 @@ matches:
         assert!(x.text.len() == 4 && x.text.chars().all(|c| c.is_ascii_digit()), "{}", x.text);
     }
 
+    /// Answers every form with fixed values and records the forms.
+    struct Answer(HashMap<String, String>, std::sync::Arc<Mutex<Vec<Form>>>);
+
+    impl Ask for Answer {
+        fn ask(&self, form: Form) -> Option<HashMap<String, String>> {
+            self.1.lock().unwrap().push(form);
+            Some(self.0.clone())
+        }
+    }
+
     #[test]
-    fn form_snippet_is_not_inserted() {
+    fn canceled_form_inserts_nothing() {
         let (mut e, _d) = engine(&[("match/base.yml", BASE)]);
         assert_eq!(typed(&mut e, ":form"), None);
-        let form = e.entries().into_iter().find(|x| x.trigger == ":form").unwrap();
-        assert!(!form.insertable);
+        // The next trigger still works.
+        assert_eq!(text(typed(&mut e, " :hi")), Some((3, "hello".into(), 0)));
+    }
+
+    #[test]
+    fn form_and_choice_use_the_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("config")).unwrap();
+        std::fs::create_dir_all(dir.path().join("match")).unwrap();
+        std::fs::write(dir.path().join("config/default.yml"), "").unwrap();
+        let choice = r##"
+  - trigger: ":pick"
+    replace: "{{c}}"
+    vars:
+      - name: c
+        type: choice
+        params:
+          values:
+            - label: "Red"
+              id: "#f00"
+            - "blue"
+"##;
+        std::fs::write(dir.path().join("match/base.yml"), format!("{BASE}{choice}")).unwrap();
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let answers = HashMap::from([
+            ("name".to_string(), "Bob".to_string()),
+            ("choice".to_string(), "Red".to_string()),
+        ]);
+        let mut e = Engine::load_with(dir.path(), Box::new(Answer(answers, seen.clone()))).unwrap();
+        assert_eq!(text(typed(&mut e, ":form")), Some((5, "Hi Bob".into(), 0)));
+        assert_eq!(text(typed(&mut e, " :pick")), Some((5, "#f00".into(), 0)));
+        let seen = seen.lock().unwrap();
+        let preview = seen[0].preview.as_ref().unwrap();
+        assert_eq!(seen[0].fill(&HashMap::from([("name".into(), "Al".into())])), "Hi Al");
+        assert_eq!(preview.vars, ["form1"]);
+        assert!(seen[1].is_choice());
     }
 
     #[test]

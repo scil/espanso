@@ -19,6 +19,7 @@ pub mod caret;
 pub mod data;
 pub mod expand;
 pub mod focus;
+pub mod form;
 pub mod hook;
 pub mod log;
 pub mod place;

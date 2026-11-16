@@ -9,7 +9,14 @@
 //! (`popup_core::expand`) gets every key press from the hook and expands
 //! espanso triggers, so espanso itself does not need to run. See
 //! `studio/EXPANDER.md`.
+//!
+//! Forms and `choice` variables open a window of their own near the caret
+//! ([`form_view`]). That window takes the focus while the user types.
 #![windows_subsystem = "windows"]
+
+mod form_view;
+
+use std::collections::HashMap;
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -22,7 +29,8 @@ use gpui_kit::*;
 use popup_core::args::Args;
 use popup_core::caret::{self, Caret};
 use popup_core::data::{self, Entry};
-use popup_core::expand::{Engine, Expansion, Input, Method};
+use popup_core::expand::{Ask, Engine, Expansion, Input, Method};
+use popup_core::form::Form;
 use popup_core::focus::{self, Handle};
 use popup_core::hook::{self, HookEvent, Shared};
 use popup_core::{place, timing, Rect};
@@ -51,7 +59,10 @@ enum ToEngine {
 fn engine_thread(base: Option<PathBuf>, rx: Receiver<ToEngine>, shared: Arc<Shared>, ui: Sender<Ui>) {
     let loaded = snip_core::Workspace::open(base)
         .map_err(|e| e.to_string())
-        .and_then(|ws| Engine::load(ws.base()).map_err(|e| format!("{e:#}")));
+        .and_then(|ws| {
+            let ask = UiAsk { ui: ui.clone(), shared: shared.clone() };
+            Engine::load_with(ws.base(), Box::new(ask)).map_err(|e| format!("{e:#}"))
+        });
     let mut engine = match loaded {
         Ok(engine) => {
             let entries = engine.entries();
@@ -98,6 +109,43 @@ fn engine_thread(base: Option<PathBuf>, rx: Receiver<ToEngine>, shared: Arc<Shar
     }
 }
 
+/// Shows forms in the UI. It runs on the engine thread, which waits for the
+/// answer, so the trigger stays in the text until the user submits.
+struct UiAsk {
+    ui: Sender<Ui>,
+    shared: Arc<Shared>,
+}
+
+impl Ask for UiAsk {
+    fn ask(&self, form: Form) -> Option<HashMap<String, String>> {
+        // The popup may be open: the trigger can start with the popup
+        // trigger.
+        if self.shared.is_active() {
+            self.shared.deactivate();
+            let _ = self.ui.send(Ui::Hook(HookEvent::Cancel));
+        }
+        // Give the application a moment to draw the last trigger character.
+        std::thread::sleep(Duration::from_millis(10));
+        let target = focus::foreground();
+        let caret = caret::locate(Duration::from_millis(150));
+        let (reply, answer) = form_view::reply_channel();
+        popup_core::log::line(&format!("form: open, {} fields", form.fields.len()));
+        if self.ui.send(Ui::Form { form, caret, reply }).is_err() {
+            return None;
+        }
+        // A closed channel without an answer counts as Cancel.
+        let answer = answer.recv().ok().flatten();
+        // Give the focus back only if a window of this process still has
+        // it. If the user clicked another window, that window keeps it.
+        if let Some(h) = target {
+            if focus::foreground().is_some_and(focus::is_own) {
+                focus::restore(h);
+            }
+        }
+        answer
+    }
+}
+
 /// Erases the trigger, inserts the text and moves the caret.
 fn perform(x: &Expansion) {
     let started = Instant::now();
@@ -123,6 +171,8 @@ fn perform(x: &Expansion) {
 enum Ui {
     Open { caret: Caret, pressed: Instant },
     Hook(HookEvent),
+    /// Show a form near the caret and send the answer on `reply`.
+    Form { form: Form, caret: Caret, reply: form_view::Reply },
 }
 
 /// Turns hook events into UI messages. It looks up the caret for `Open`, so
@@ -250,6 +300,11 @@ impl Popup {
 
     fn handle(&mut self, msg: Ui, window: &mut Window, cx: &mut Context<Self>) {
         match msg {
+            // A form or an expansion can end the session before the caret
+            // lookup for `Open` is done.
+            Ui::Open { .. } if !self.shared.is_active() => {
+                popup_core::log::line("ui ignored open: the session already ended");
+            }
             Ui::Open { caret, pressed } => {
                 self.open = true;
                 self.caret = Some(caret);
@@ -259,6 +314,11 @@ impl Popup {
                 self.refresh(cx);
                 self.place_and_show();
                 window.on_next_frame(move |_, _| timing::since("open-to-frame", pressed));
+            }
+            Ui::Form { form, caret, reply } => {
+                // Open the window after this update: gpui does not open a
+                // window while it updates another one.
+                cx.defer(move |cx| form_view::open(form, caret, reply, cx));
             }
             Ui::Hook(ev) if !self.open => {
                 popup_core::log::line(&format!("ui ignored {:?} while closed", kind(&ev)));
@@ -355,7 +415,7 @@ impl Popup {
             e.insertable
         ));
         if !e.insertable {
-            self.note = Some("Forms and images come in phase two. Esc closes.".into());
+            self.note = Some("Image snippets come later. Esc closes.".into());
             cx.notify();
             return;
         }
@@ -378,7 +438,7 @@ impl Render for Popup {
             let badge = if !e.label.is_empty() {
                 e.trigger.clone()
             } else if !e.insertable {
-                "form".to_string()
+                "image".to_string()
             } else {
                 String::new()
             };

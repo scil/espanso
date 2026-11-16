@@ -162,7 +162,7 @@ A test typed `@@sig` with `--trigger @@`, then pressed Enter. The popup erased t
 
 - A program that shows its own completion list, such as a code editor, also reacts to Up, Down and Enter. The hook swallows those keys while the popup is open, so the program's list does not get them.
 - The hook counts the keyword from the key presses. If the application changes the text itself, for example with auto-correction, the Backspace count is wrong.
-- Snippets with a form, a `choice` variable or an image show the `form` badge. Enter shows a note and inserts nothing. Forms come in phase two (see `EXPANDER.md`).
+- Snippets with an image show the `image` badge. Enter shows a note and inserts nothing. Snippets with a form or a `choice` variable open the form window near the caret (see `EXPANDER.md`).
 - Windows does not give the keys of an administrator window to the hook of a normal process. If you use an administrator window, such as Cmder, run popup-ime as administrator. `scripts/win/popup-ime.ps1 -Action start` does this with one UAC prompt, and `-Action stop` stops it. A normal process cannot stop a popup-ime that runs as administrator. The script writes the log to `%LOCALAPPDATA%\popup-ime\events.log`.
 - A low-level hook must answer within the system timeout, about 300 ms by default. The hook only updates its state and sends a message, so it answers in microseconds.
 
