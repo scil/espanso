@@ -1,0 +1,38 @@
+[package]
+name = "popup-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Shared logic for the caret popup prototypes: caret lookup, placement, focus, snippet search"
+
+[dependencies]
+anyhow.workspace = true
+serde_norway.workspace = true
+snip-core.workspace = true
+espanso-config.workspace = true
+espanso-match.workspace = true
+espanso-render.workspace = true
+unicode-segmentation.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Dwm",
+  "Win32_Graphics_Gdi",
+  "Win32_System_Com",
+  "Win32_System_DataExchange",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_Memory",
+  "Win32_System_Ole",
+  "Win32_System_SystemInformation",
+  "Win32_System_Threading",
+  "Win32_System_Variant",
+  "Win32_UI_Accessibility",
+  "Win32_UI_HiDpi",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
+]

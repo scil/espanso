@@ -1,0 +1,30 @@
+# Separate workspace for the Snippet Studio companion tools.
+# It is not a member of the root espanso workspace, so upstream merges never
+# touch it. It depends on espanso-config, espanso-match and espanso-render by
+# path to reuse espanso's parser, trigger matcher and renderer.
+[workspace]
+resolver = "2"
+members = ["snip-core", "snipctl", "popup-core", "popup-slint", "popup-gpui"]
+
+[workspace.package]
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+[workspace.dependencies]
+anyhow = "1.0"
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_norway = "0.9.42"
+yaml-edit = "0.3.6"
+sha2 = "0.10"
+walkdir = "2.3"
+dirs = "5.0"
+tempfile = "3"
+clap = { version = "4", features = ["derive"] }
+espanso-config = { path = "../espanso-config" }
+espanso-match = { path = "../espanso-match" }
+espanso-render = { path = "../espanso-render" }
+unicode-segmentation = "1"
+snip-core = { path = "snip-core" }
+popup-core = { path = "popup-core" }

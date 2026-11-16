@@ -1,0 +1,702 @@
+//! Trigger expansion, the work of the espanso daemon, built on espanso's own
+//! library crates: `espanso-config` reads the configuration, `espanso-match`
+//! finds triggers in the typed keys, and `espanso-render` fills variables.
+//! The glue between them follows espanso's worker and `espanso-engine`. See
+//! `studio/EXPANDER.md`.
+//!
+//! The engine has no Windows code, so its tests run anywhere. The caller
+//! feeds it key presses ([`Engine::key`]) and does what the returned
+//! [`Expansion`] says: erase, insert, move the caret.
+//!
+//! The loaded configuration lives until the process ends (`Box::leak`),
+//! because the matcher state borrows the matcher and the match set borrows
+//! the store. A reload loads it again and leaks the old one. espanso numbers
+//! matches with a thread-local counter, so one thread must load and use the
+//! engine.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
+
+use anyhow::{anyhow, Result};
+use espanso_config::config::{AppProperties, Config, ConfigStore};
+use espanso_config::matches::store::{MatchSet, MatchStore};
+use espanso_config::matches::{
+    Match, MatchCause, MatchEffect, TextInjectMode, UpperCasingStyle,
+};
+use espanso_match::event::{Event, Key as MatchKey};
+use espanso_match::regex::{RegexMatch, RegexMatcher, RegexMatcherOptions, RegexMatcherState};
+use espanso_match::rolling::matcher::{
+    RollingMatcher, RollingMatcherOptions, RollingMatcherState,
+};
+use espanso_match::rolling::{RollingMatch, StringMatchOptions};
+use espanso_match::{MatchResult, Matcher};
+use espanso_render::extension::choice::{Choice, ChoiceSelector, ChoiceSelectorResult};
+use espanso_render::extension::clipboard::ClipboardProvider;
+use espanso_render::extension::form::{FormProvider, FormProviderResult};
+use espanso_render::{
+    CasingStyle, Context, Params, RenderOptions, RenderResult, Renderer, Template, Value,
+    Variable,
+};
+use unicode_segmentation::UnicodeSegmentation;
+
+use crate::data::Entry;
+
+/// A key press as the engine sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Input {
+    /// A typed character. Enter is `'\n'` and Tab is `'\t'`.
+    Char(char),
+    Backspace,
+    /// A key or click that moves the caret or ends the typing: an arrow key,
+    /// Home, End, Escape, a key with Ctrl, Alt or Win, a mouse click. The
+    /// matcher forgets the keys it saw.
+    Reset,
+}
+
+/// The foreground application, for per-application configurations
+/// (`filter_exec`, `filter_title`).
+#[derive(Debug, Clone, Default)]
+pub struct App {
+    /// Full path of the program, as espanso uses it.
+    pub exec: Option<String>,
+    pub title: Option<String>,
+}
+
+/// How to insert the text of an expansion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Method {
+    /// The `--short-limit` and `--long-text` settings decide.
+    Auto,
+    /// The snippet has `force_mode: keys`.
+    Keys,
+    /// The snippet has `force_mode: clipboard`.
+    Paste,
+}
+
+/// What the caller must do for one expansion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Expansion {
+    /// Backspaces that erase the trigger.
+    pub erase: usize,
+    pub text: String,
+    /// Left arrow presses after the text, for the cursor hint `$|$`.
+    pub lefts: usize,
+    pub method: Method,
+    /// Match id, for the log.
+    pub id: i32,
+}
+
+/// The last expansion, for `undo_backspace`: a Backspace right after it
+/// erases the text and types the trigger again.
+struct Undo {
+    trigger: String,
+    len: usize,
+    enabled: bool,
+}
+
+type States = (RollingMatcherState<'static, i32>, Option<RegexMatcherState>);
+
+pub struct Engine {
+    configs: &'static dyn ConfigStore,
+    store: &'static dyn MatchStore,
+    /// All matches of all configurations, in load order.
+    all: Vec<&'static Match>,
+    by_id: HashMap<i32, &'static Match>,
+    rolling: &'static RollingMatcher<i32>,
+    regex: &'static RegexMatcher<i32>,
+    /// One matcher state per key press, newest last, so that Backspace can
+    /// go back one key.
+    history: VecDeque<States>,
+    limit: usize,
+    templates: &'static HashMap<i32, Template>,
+    global_vars: &'static HashMap<i32, Variable>,
+    contexts: HashMap<i32, Context<'static>>,
+    renderer: &'static dyn Renderer,
+    undo: Option<Undo>,
+}
+
+impl Engine {
+    /// Loads the espanso configuration in `base` (the folder that holds
+    /// `config` and `match`).
+    pub fn load(base: &Path) -> Result<Engine> {
+        let (configs, store, errors) = espanso_config::load(base)?;
+        for set in &errors {
+            for e in &set.errors {
+                crate::log::line(&format!("config problem in {}: {}", set.file.display(), e.error));
+            }
+        }
+        let configs: &'static dyn ConfigStore = Box::leak(configs);
+        let store: &'static dyn MatchStore = Box::leak(store);
+
+        let paths: Vec<String> = configs.get_all_match_paths().into_iter().collect();
+        let all: Vec<&'static Match> = store.query(&paths).matches;
+        let by_id = all.iter().map(|m| (m.id, *m)).collect();
+
+        let default = configs.default();
+        let mut rolling = Vec::new();
+        let mut regex = Vec::new();
+        for m in &all {
+            match &m.cause {
+                MatchCause::Trigger(cause) => {
+                    for trigger in &cause.triggers {
+                        rolling.push(RollingMatch::from_string(
+                            m.id,
+                            trigger,
+                            &StringMatchOptions {
+                                case_insensitive: cause.propagate_case,
+                                left_word: cause.left_word,
+                                right_word: cause.right_word,
+                            },
+                        ));
+                    }
+                }
+                MatchCause::Regex(cause) => regex.push(RegexMatch::new(m.id, &cause.regex)),
+                MatchCause::None => {}
+            }
+        }
+        let rolling = Box::leak(Box::new(RollingMatcher::new(
+            &rolling,
+            RollingMatcherOptions {
+                char_word_separators: default.word_separators(),
+                key_word_separators: vec![],
+            },
+        )));
+        let regex = Box::leak(Box::new(RegexMatcher::new(
+            &regex,
+            RegexMatcherOptions { max_buffer_size: default.max_regex_buffer_size() },
+        )));
+
+        let templates: HashMap<i32, Template> =
+            all.iter().filter_map(|m| Some((m.id, to_template(m)?))).collect();
+        let mut global_vars = HashMap::new();
+        for config in configs.configs() {
+            for var in store.query(config.match_paths()).global_vars {
+                global_vars.entry(var.id).or_insert_with(|| to_variable(var.clone()));
+            }
+        }
+
+        Ok(Engine {
+            configs,
+            store,
+            all,
+            by_id,
+            rolling,
+            regex,
+            history: VecDeque::new(),
+            limit: default.backspace_limit().max(1),
+            templates: Box::leak(Box::new(templates)),
+            global_vars: Box::leak(Box::new(global_vars)),
+            contexts: HashMap::new(),
+            renderer: renderer(base),
+            undo: None,
+        })
+    }
+
+    /// Feeds one key press. `app` is called only when a trigger matched.
+    pub fn key(&mut self, input: Input, app: impl FnOnce() -> App) -> Option<Expansion> {
+        let undo = self.undo.take();
+        match input {
+            Input::Backspace => {
+                if let Some(u) = undo.filter(|u| u.enabled) {
+                    self.history.clear();
+                    // The user's Backspace already erased one character.
+                    return Some(Expansion {
+                        erase: u.len.saturating_sub(1),
+                        text: u.trigger,
+                        lefts: 0,
+                        method: Method::Keys,
+                        id: -1,
+                    });
+                }
+                self.history.pop_back();
+                None
+            }
+            Input::Reset => {
+                self.history.clear();
+                None
+            }
+            Input::Char(c) => {
+                let key = match c {
+                    '\n' => MatchKey::Enter,
+                    '\t' => MatchKey::Tab,
+                    ' ' => MatchKey::Space,
+                    _ => MatchKey::Other,
+                };
+                let results = self.feed(Event::Key { key, chars: Some(c.to_string()) });
+                if results.is_empty() {
+                    None
+                } else {
+                    self.expand(results, &app())
+                }
+            }
+        }
+    }
+
+    /// Tells the matcher that text went in by other means (the popup). The
+    /// next trigger can follow it, as after a word separator.
+    pub fn inserted(&mut self) {
+        self.history.clear();
+        self.undo = None;
+        self.feed(Event::VirtualSeparator);
+    }
+
+    fn feed(&mut self, event: Event) -> Vec<MatchResult<i32>> {
+        let prev = self.history.back();
+        let (rolling_state, mut results) = self.rolling.process(prev.map(|s| &s.0), event.clone());
+        let (regex_state, regex_results) =
+            self.regex.process(prev.and_then(|s| s.1.as_ref()), event);
+        results.extend(regex_results);
+        self.history.push_back((rolling_state, Some(regex_state)));
+        while self.history.len() > self.limit {
+            self.history.pop_front();
+        }
+        results
+    }
+
+    fn expand(&mut self, results: Vec<MatchResult<i32>>, app: &App) -> Option<Expansion> {
+        let props = AppProperties {
+            title: app.title.as_deref(),
+            class: None,
+            exec: app.exec.as_deref(),
+        };
+        let config = self.configs.active(&props);
+        let set = self.store.query(config.match_paths());
+        let active: HashSet<i32> = set.matches.iter().map(|m| m.id).collect();
+        let mut valid = results.into_iter().filter(|r| active.contains(&r.id));
+        let chosen = valid.next()?;
+        let others = valid.count();
+        if others > 0 {
+            crate::log::line(&format!("expand: {} other matches for the trigger, took the first", others));
+        }
+        self.history.clear();
+        let m = *self.by_id.get(&chosen.id)?;
+        let body = match self.render(m, Some(&chosen.trigger), chosen.vars, config.as_ref(), &set) {
+            Ok(body) => body,
+            Err(e) => {
+                crate::log::line(&format!("expand: match {} not rendered: {e}", m.id));
+                return None;
+            }
+        };
+        let left = chosen.left_separator.as_deref().map_or(0, |s| s.chars().count());
+        let erase = chosen.trigger.chars().count().saturating_sub(left);
+        let mut body = body;
+        if let Some(right) = &chosen.right_separator {
+            body.push_str(right);
+        }
+        let (text, lefts) = cursor_hint(&body);
+        self.undo = (lefts == 0).then(|| Undo {
+            trigger: chosen.trigger.chars().skip(left).collect(),
+            len: text.chars().count(),
+            enabled: config.undo_backspace(),
+        });
+        self.feed(Event::VirtualSeparator);
+        Some(Expansion { erase, text, lefts, method: method_of(m), id: m.id })
+    }
+
+    /// Renders a match for the popup: no trigger, so no case change. The
+    /// popup erases its own trigger and keyword.
+    pub fn render_by_id(&mut self, id: i32, app: &App) -> Result<Expansion> {
+        let m = *self.by_id.get(&id).ok_or_else(|| anyhow!("no match with id {id}"))?;
+        let props = AppProperties {
+            title: app.title.as_deref(),
+            class: None,
+            exec: app.exec.as_deref(),
+        };
+        let config = self.configs.active(&props);
+        let set = self.store.query(config.match_paths());
+        let body = self.render(m, None, HashMap::new(), config.as_ref(), &set)?;
+        let (text, lefts) = cursor_hint(&body);
+        Ok(Expansion { erase: 0, text, lefts, method: method_of(m), id })
+    }
+
+    fn render(
+        &mut self,
+        m: &Match,
+        trigger: Option<&str>,
+        trigger_vars: HashMap<String, String>,
+        config: &dyn Config,
+        set: &MatchSet<'static>,
+    ) -> Result<String> {
+        let template =
+            self.templates.get(&m.id).ok_or_else(|| anyhow!("only text snippets can expand"))?;
+        let (templates, global_vars) = (self.templates, self.global_vars);
+        let context = self
+            .contexts
+            .entry(config.id())
+            .or_insert_with(|| context_for(set, templates, global_vars));
+        let options = RenderOptions { casing_style: casing_of(m, trigger) };
+        let mut augmented;
+        let template = if trigger_vars.is_empty() {
+            template
+        } else {
+            augmented = template.clone();
+            for (name, value) in trigger_vars {
+                let mut params = Params::new();
+                params.insert("echo".to_string(), Value::String(value));
+                augmented.vars.insert(
+                    0,
+                    Variable {
+                        name,
+                        var_type: "echo".to_string(),
+                        params,
+                        inject_vars: false,
+                        ..Default::default()
+                    },
+                );
+            }
+            &augmented
+        };
+        match self.renderer.render(template, context, &options) {
+            RenderResult::Success(body) => Ok(body),
+            RenderResult::Aborted => Err(anyhow!("aborted")),
+            RenderResult::Error(e) => Err(e),
+        }
+    }
+
+    /// The snippets for the popup list, in load order.
+    pub fn entries(&self) -> Vec<Entry> {
+        self.all
+            .iter()
+            .filter_map(|m| {
+                let trigger = match &m.cause {
+                    MatchCause::Trigger(c) => c.triggers.join("  "),
+                    MatchCause::Regex(c) => c.regex.clone(),
+                    MatchCause::None => return None,
+                };
+                let (text, insertable) = match &m.effect {
+                    MatchEffect::Text(t) => (
+                        t.replace.clone(),
+                        !t.vars.iter().any(|v| v.var_type == "form" || v.var_type == "choice"),
+                    ),
+                    MatchEffect::Image(i) => (i.path.clone(), false),
+                    MatchEffect::None => return None,
+                };
+                Some(Entry::new(
+                    m.id,
+                    trigger,
+                    m.label.clone().unwrap_or_default(),
+                    &text,
+                    &m.search_terms,
+                    insertable,
+                ))
+            })
+            .collect()
+    }
+}
+
+fn method_of(m: &Match) -> Method {
+    match &m.effect {
+        MatchEffect::Text(t) => match t.force_mode {
+            Some(TextInjectMode::Keys) => Method::Keys,
+            Some(TextInjectMode::Clipboard) => Method::Paste,
+            None => Method::Auto,
+        },
+        _ => Method::Auto,
+    }
+}
+
+/// Removes the first `$|$` and counts the Left presses that put the caret
+/// there, in graphemes, as espanso does.
+pub fn cursor_hint(body: &str) -> (String, usize) {
+    match body.find("$|$") {
+        Some(index) => {
+            let before = body[..index].graphemes(true).count();
+            let total = body.graphemes(true).count();
+            (body.replacen("$|$", "", 1), total - before - 3)
+        }
+        None => (body.to_string(), 0),
+    }
+}
+
+fn casing_of(m: &Match, trigger: Option<&str>) -> CasingStyle {
+    match (&m.cause, trigger) {
+        (MatchCause::Trigger(cause), Some(trigger)) if cause.propagate_case => {
+            casing_style(trigger, &cause.uppercase_style)
+        }
+        _ => CasingStyle::None,
+    }
+}
+
+/// The case of the typed trigger, copied from espanso's worker
+/// (`calculate_casing_style`).
+fn casing_style(trigger: &str, style: &UpperCasingStyle) -> CasingStyle {
+    let mut letters = trigger.chars().filter(|c| c.is_alphabetic());
+    let (Some(first), second) = (letters.next(), letters.next()) else {
+        return CasingStyle::None;
+    };
+    if !first.is_uppercase() {
+        return CasingStyle::None;
+    }
+    match (second, style) {
+        (Some(s), _) if s.is_uppercase() => CasingStyle::Uppercase,
+        (Some(_), UpperCasingStyle::CapitalizeWords) => CasingStyle::CapitalizeWords,
+        (Some(_), _) => CasingStyle::Capitalize,
+        (None, UpperCasingStyle::Capitalize) => CasingStyle::Capitalize,
+        (None, UpperCasingStyle::CapitalizeWords) => CasingStyle::CapitalizeWords,
+        (None, UpperCasingStyle::Uppercase) => CasingStyle::Uppercase,
+    }
+}
+
+fn context_for(
+    set: &MatchSet<'static>,
+    templates: &'static HashMap<i32, Template>,
+    global_vars: &'static HashMap<i32, Variable>,
+) -> Context<'static> {
+    Context {
+        templates: set.matches.iter().filter_map(|m| templates.get(&m.id)).collect(),
+        global_vars: set.global_vars.iter().filter_map(|v| global_vars.get(&v.id)).collect(),
+    }
+}
+
+fn to_template(m: &Match) -> Option<Template> {
+    let MatchEffect::Text(effect) = &m.effect else { return None };
+    let ids = match &m.cause {
+        MatchCause::Trigger(cause) => cause.triggers.clone(),
+        _ => Vec::new(),
+    };
+    Some(Template {
+        ids,
+        body: effect.replace.clone(),
+        vars: effect.vars.iter().cloned().map(to_variable).collect(),
+    })
+}
+
+fn to_variable(var: espanso_config::matches::Variable) -> Variable {
+    Variable {
+        name: var.name,
+        var_type: var.var_type,
+        params: to_params(var.params),
+        inject_vars: var.inject_vars,
+        depends_on: var.depends_on,
+    }
+}
+
+fn to_params(params: espanso_config::matches::Params) -> Params {
+    params.into_iter().map(|(k, v)| (k, to_value(v))).collect()
+}
+
+fn to_value(value: espanso_config::matches::Value) -> Value {
+    use espanso_config::matches::{Number, Value as V};
+    match value {
+        V::Null => Value::Null,
+        V::Bool(b) => Value::Bool(b),
+        V::Number(Number::Integer(i)) => Value::Number(espanso_render::Number::Integer(i)),
+        V::Number(Number::Float(f)) => Value::Number(espanso_render::Number::Float(f.into_inner())),
+        V::String(s) => Value::String(s),
+        V::Array(a) => Value::Array(a.into_iter().map(to_value).collect()),
+        V::Object(o) => Value::Object(to_params(o)),
+    }
+}
+
+/// The clipboard text for `{{clipboard}}` variables.
+struct ClipboardText;
+
+impl ClipboardProvider for ClipboardText {
+    fn get_text(&self) -> Option<String> {
+        crate::focus::clipboard_text()
+    }
+}
+
+/// Forms and choice variables come in phase two.
+struct NoForms;
+
+impl FormProvider for NoForms {
+    fn show(&self, _: &str, _: &Params, _: &Params) -> FormProviderResult {
+        FormProviderResult::Error(anyhow!("forms are not supported yet"))
+    }
+}
+
+impl ChoiceSelector for NoForms {
+    fn show(&self, _: &[Choice]) -> ChoiceSelectorResult {
+        ChoiceSelectorResult::Error(anyhow!("choice variables are not supported yet"))
+    }
+}
+
+/// The renderer with espanso's extensions. `base` is espanso's config
+/// folder: `%CONFIG%` in scripts and the working folder of shell commands.
+fn renderer(base: &Path) -> &'static dyn Renderer {
+    use espanso_render::extension::{
+        choice::ChoiceExtension, clipboard::ClipboardExtension, date::DateExtension,
+        date::DefaultLocaleProvider, echo::EchoExtension, form::FormExtension,
+        random::RandomExtension, script::ScriptExtension, shell::ShellExtension,
+    };
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| base.to_path_buf());
+    let packages = base.join("match").join("packages");
+    let locale: &'static DefaultLocaleProvider = Box::leak(Box::new(DefaultLocaleProvider::new()));
+    let extensions: Vec<&'static dyn espanso_render::Extension> = vec![
+        Box::leak(Box::new(ClipboardExtension::new(&ClipboardText))),
+        Box::leak(Box::new(DateExtension::new(locale))),
+        Box::leak(Box::new(EchoExtension::new())),
+        Box::leak(Box::new(RandomExtension::new())),
+        Box::leak(Box::new(ScriptExtension::new(base, &home, &packages))),
+        Box::leak(Box::new(ShellExtension::new(base))),
+        Box::leak(Box::new(FormExtension::new(&NoForms))),
+        Box::leak(Box::new(ChoiceExtension::new(&NoForms))),
+    ];
+    Box::leak(Box::new(espanso_render::create(extensions)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Writes a configuration folder and loads it. `files` are paths
+    /// relative to the base with their text.
+    fn engine(files: &[(&str, &str)]) -> (Engine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("config")).unwrap();
+        std::fs::create_dir_all(dir.path().join("match")).unwrap();
+        std::fs::write(dir.path().join("config/default.yml"), "").unwrap();
+        for (path, text) in files {
+            std::fs::write(dir.path().join(path), text).unwrap();
+        }
+        (Engine::load(dir.path()).unwrap(), dir)
+    }
+
+    fn typed(e: &mut Engine, s: &str) -> Option<Expansion> {
+        typed_in(e, s, App::default())
+    }
+
+    fn typed_in(e: &mut Engine, s: &str, app: App) -> Option<Expansion> {
+        let mut last = None;
+        for c in s.chars() {
+            last = e.key(Input::Char(c), || app.clone());
+        }
+        last
+    }
+
+    fn text(x: Option<Expansion>) -> Option<(usize, String, usize)> {
+        x.map(|x| (x.erase, x.text, x.lefts))
+    }
+
+    const BASE: &str = r#"
+matches:
+  - trigger: ":hi"
+    replace: "hello"
+  - trigger: "alh"
+    replace: "although"
+    propagate_case: true
+  - trigger: "hw"
+    replace: "hello world"
+    left_word: true
+  - trigger: ":cur"
+    replace: "a$|$bc"
+  - regex: "=(?P<n>\\d+)x"
+    replace: "{{n}}!"
+  - trigger: ":year"
+    replace: "{{y}}"
+    vars:
+      - name: y
+        type: date
+        params:
+          format: "%Y"
+  - trigger: ":form"
+    form: "Hi [[name]]"
+"#;
+
+    #[test]
+    fn plain_trigger_expands() {
+        let (mut e, _d) = engine(&[("match/base.yml", BASE)]);
+        assert_eq!(text(typed(&mut e, "say :hi")), Some((3, "hello".into(), 0)));
+    }
+
+    #[test]
+    fn backspace_inside_a_trigger() {
+        let (mut e, _d) = engine(&[("match/base.yml", BASE)]);
+        assert_eq!(typed(&mut e, ":hx"), None);
+        assert_eq!(e.key(Input::Backspace, App::default), None);
+        assert_eq!(text(typed(&mut e, "i")), Some((3, "hello".into(), 0)));
+    }
+
+    #[test]
+    fn reset_forgets_typed_keys() {
+        let (mut e, _d) = engine(&[("match/base.yml", BASE)]);
+        typed(&mut e, ":h");
+        e.key(Input::Reset, App::default);
+        assert_eq!(typed(&mut e, "i"), None);
+    }
+
+    #[test]
+    fn left_word_needs_a_separator() {
+        let (mut e, _d) = engine(&[("match/base.yml", BASE)]);
+        assert_eq!(typed(&mut e, "ahw"), None);
+        // The separator stays: only the trigger is erased.
+        assert_eq!(text(typed(&mut e, " hw")), Some((2, "hello world".into(), 0)));
+    }
+
+    #[test]
+    fn case_propagates() {
+        let (mut e, _d) = engine(&[("match/base.yml", BASE)]);
+        assert_eq!(typed(&mut e, " Alh").map(|x| x.text), Some("Although".into()));
+        assert_eq!(typed(&mut e, " ALH").map(|x| x.text), Some("ALTHOUGH".into()));
+        assert_eq!(typed(&mut e, " alh").map(|x| x.text), Some("although".into()));
+    }
+
+    #[test]
+    fn cursor_hint_moves_left() {
+        let (mut e, _d) = engine(&[("match/base.yml", BASE)]);
+        assert_eq!(text(typed(&mut e, ":cur")), Some((4, "abc".into(), 2)));
+        assert_eq!(cursor_hint("🦊$|$é"), ("🦊é".into(), 1));
+    }
+
+    #[test]
+    fn regex_captures_become_variables() {
+        let (mut e, _d) = engine(&[("match/base.yml", BASE)]);
+        assert_eq!(text(typed(&mut e, "=12x")), Some((4, "12!".into(), 0)));
+    }
+
+    #[test]
+    fn date_variable_renders() {
+        let (mut e, _d) = engine(&[("match/base.yml", BASE)]);
+        let x = typed(&mut e, ":year").unwrap();
+        assert!(x.text.len() == 4 && x.text.chars().all(|c| c.is_ascii_digit()), "{}", x.text);
+    }
+
+    #[test]
+    fn form_snippet_is_not_inserted() {
+        let (mut e, _d) = engine(&[("match/base.yml", BASE)]);
+        assert_eq!(typed(&mut e, ":form"), None);
+        let form = e.entries().into_iter().find(|x| x.trigger == ":form").unwrap();
+        assert!(!form.insertable);
+    }
+
+    #[test]
+    fn backspace_after_expansion_undoes_it() {
+        let (mut e, _d) = engine(&[("match/base.yml", BASE)]);
+        typed(&mut e, ":hi");
+        assert_eq!(text(e.key(Input::Backspace, App::default)), Some((4, ":hi".into(), 0)));
+        // Only right after the expansion.
+        typed(&mut e, ":hi");
+        typed(&mut e, "x");
+        assert_eq!(e.key(Input::Backspace, App::default), None);
+    }
+
+    #[test]
+    fn per_application_matches() {
+        let (mut e, _d) = engine(&[
+            ("match/base.yml", BASE),
+            ("match/_np.yml", "matches:\n  - trigger: \":np\"\n    replace: \"notepad\"\n"),
+            (
+                "config/np.yml",
+                "filter_exec: \"notepad.exe\"\nextra_includes:\n  - \"../match/_np.yml\"\n",
+            ),
+        ]);
+        let other = App { exec: Some(r"C:\Tools\other.exe".into()), title: None };
+        let notepad = App { exec: Some(r"C:\Windows\notepad.exe".into()), title: None };
+        assert_eq!(typed_in(&mut e, ":np", other.clone()), None);
+        assert_eq!(typed_in(&mut e, " :np", notepad.clone()).map(|x| x.text), Some("notepad".into()));
+        // The default matches stay valid in the application.
+        assert_eq!(typed_in(&mut e, " :hi", notepad).map(|x| x.text), Some("hello".into()));
+    }
+
+    #[test]
+    fn popup_renders_by_id() {
+        let (mut e, _d) = engine(&[("match/base.yml", BASE)]);
+        let entry = e.entries().into_iter().find(|x| x.trigger == ":cur").unwrap();
+        let x = e.render_by_id(entry.id, &App::default()).unwrap();
+        assert_eq!((x.text.as_str(), x.lefts), ("abc", 2));
+    }
+}
