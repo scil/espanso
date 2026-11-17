@@ -55,8 +55,11 @@ enum Command {
         index: usize,
         hash: String,
     },
-    /// Run espanso's loader on the whole folder and print its problems.
+    /// Run espanso's loader on the whole folder and print its problems,
+    /// bad `snip.priority` values and shared triggers.
     Validate,
+    /// Print each trigger that several active matches share, winner first.
+    Conflicts,
     /// Serve JSON-RPC 2.0 over standard input and output, one message per line.
     Serve,
 }
@@ -91,6 +94,7 @@ fn run(cli: Cli) -> Result<(), SnipError> {
             json!({ "deleted": true })
         }
         Command::Validate => json!({ "problems": ws.validate()? }),
+        Command::Conflicts => json!({ "conflicts": ws.conflicts()? }),
         Command::Serve => {
             let stdin = std::io::stdin();
             rpc::serve(&ws, stdin.lock(), std::io::stdout().lock())?;

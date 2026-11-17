@@ -625,14 +625,15 @@ pub fn hide(h: Handle) {
     }
 }
 
-pub fn set_no_activate(h: Handle) {
+pub fn set_no_activate(h: Handle, on: bool) {
     use windows::Win32::UI::WindowsAndMessaging::{
         GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_NOACTIVATE,
     };
     unsafe {
         let w = hwnd(h);
         let style = GetWindowLongPtrW(w, GWL_EXSTYLE);
-        SetWindowLongPtrW(w, GWL_EXSTYLE, style | WS_EX_NOACTIVATE.0 as isize);
+        let flag = WS_EX_NOACTIVATE.0 as isize;
+        SetWindowLongPtrW(w, GWL_EXSTYLE, if on { style | flag } else { style & !flag });
     }
 }
 

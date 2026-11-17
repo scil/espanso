@@ -4,7 +4,7 @@ use serde::Serialize;
 pub struct Problem {
     /// Path relative to the espanso base directory, with `/` separators.
     pub file: String,
-    /// `error` or `warning`.
+    /// `error`, `warning` or `info`.
     pub level: String,
     pub message: String,
 }

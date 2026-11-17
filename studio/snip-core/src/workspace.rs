@@ -8,6 +8,7 @@ use serde_norway::Value;
 
 use crate::error::{Problem, Result, SnipError};
 use crate::portability::{self, PortabilityReport};
+use crate::priority::{self, Conflict, Origins};
 use crate::yamlfile::{hash, Item, MatchFile};
 
 /// Environment variable that overrides the espanso base folder.
@@ -285,10 +286,11 @@ impl Workspace {
         self.read_file(&rel)
     }
 
-    /// Runs espanso's own loader on the whole folder.
+    /// Runs espanso's own loader on the whole folder, then reports bad
+    /// `snip.priority` values and triggers that several matches share.
     pub fn validate(&self) -> Result<Vec<Problem>> {
-        let (_, _, errors) = espanso_config::load(&self.base)?;
-        Ok(errors
+        let (configs, store, errors) = espanso_config::load(&self.base)?;
+        let mut problems: Vec<Problem> = errors
             .into_iter()
             .flat_map(|set| {
                 let file = self.relative(&set.file);
@@ -298,7 +300,20 @@ impl Workspace {
                     message: format!("{:#}", r.error),
                 })
             })
-            .collect())
+            .collect();
+        let origins = Origins::load(&self.base, store.as_ref());
+        problems.extend(origins.problems.iter().cloned());
+        for c in priority::conflicts(configs.as_ref(), store.as_ref(), &origins) {
+            problems.push(conflict_problem(&c));
+        }
+        Ok(problems)
+    }
+
+    /// Triggers that several active matches share, with the winner first.
+    pub fn conflicts(&self) -> Result<Vec<Conflict>> {
+        let (configs, store, _) = espanso_config::load(&self.base)?;
+        let origins = Origins::load(&self.base, store.as_ref());
+        Ok(priority::conflicts(configs.as_ref(), store.as_ref(), &origins))
     }
 
     fn commit_match(&self, rel: &str, parsed: &MatchFile, new_text: &str) -> Result<()> {
@@ -396,8 +411,37 @@ impl Workspace {
     }
 
     fn relative(&self, path: &Path) -> String {
-        let rel = path.strip_prefix(&self.base).unwrap_or(path);
-        rel.to_string_lossy().replace('\\', "/")
+        priority::relative(&self.base, path)
+    }
+}
+
+/// A conflict as a problem, always `info`: a tie shows a list, and a
+/// conflict that priority settles expands the winner.
+fn conflict_problem(c: &Conflict) -> Problem {
+    let place = |m: &priority::Contender| match &m.origin {
+        Some(o) => match o.index {
+            Some(i) => format!("{} match {} (priority {})", o.file, i + 1, o.priority),
+            None => format!("{} (priority {})", o.file, o.priority),
+        },
+        None => format!("match id {}", m.id),
+    };
+    let winner = &c.matches[0];
+    let others: Vec<String> = c.matches[1..].iter().map(place).collect();
+    let message = if c.tie {
+        format!(
+            "trigger {:?} has {} matches with the same priority: {} and {}. espanso and snip show a list to pick one. Set snip.priority to expand one at once.",
+            c.trigger,
+            c.matches.len(),
+            place(winner),
+            others.join(", ")
+        )
+    } else {
+        format!("trigger {:?}: {} wins over {}", c.trigger, place(winner), others.join(", "))
+    };
+    Problem {
+        file: winner.origin.as_ref().map_or_else(String::new, |o| o.file.clone()),
+        level: "info".into(),
+        message,
     }
 }
 

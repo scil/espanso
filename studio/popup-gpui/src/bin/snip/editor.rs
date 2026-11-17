@@ -9,7 +9,8 @@
 //! espanso's own loader and refuses a write after a change on disk. After a
 //! save, `reload` makes the engine load the configuration again.
 
-use std::collections::{BTreeMap, HashSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -32,9 +33,9 @@ use snip_core::yamlfile::MatchFile;
 use snip_core::{SnipError, Workspace};
 
 const LIST_W: f32 = 320.0;
-/// The window size in logical pixels. A compact window has no list.
+/// The window size in logical pixels, with the list. "Hide list" makes the
+/// window narrower by `LIST_W`.
 const FULL_W: f32 = 1080.0;
-const COMPACT_W: f32 = FULL_W - LIST_W;
 const WINDOW_H: f32 = 780.0;
 const MAX_ROWS: usize = 300;
 const DEFAULT_FILE: &str = "match/base.yml";
@@ -47,10 +48,66 @@ pub enum Request {
     /// The list, with the first snippet selected.
     Browse,
     /// The snippet with these triggers (joined with spaces, or the regex)
-    /// and label, as the popup shows it.
-    Find { trigger: String, label: String },
+    /// and label, as the popup shows it. `keyword` is the popup's search
+    /// text and `prefix` its trigger, such as `;;`. The list shows the same
+    /// search, in the popup's order.
+    Find { trigger: String, label: String, keyword: String, prefix: String },
     /// A new snippet. `trigger` fills the first trigger.
     New { trigger: Option<String> },
+}
+
+/// What an embedded editor tells the view that holds it.
+pub enum EditorEvent {
+    /// Esc: the holder removes the form and keeps its list.
+    Close,
+    /// Ctrl+Enter after a save: the holder ends the edit.
+    Done,
+    /// Ctrl+F: the holder focuses its list.
+    FocusList,
+}
+
+impl EventEmitter<EditorEvent> for EditorView {}
+
+/// The key context of the editor. The Tab interceptor looks for it.
+const KEY_CONTEXT: &str = "SnipEditor";
+
+thread_local! {
+    /// The editors that exist, for the Tab interceptor.
+    static EDITORS: RefCell<Vec<WeakEntity<EditorView>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Makes Tab and Shift+Tab move between the boxes of the form. Call it once
+/// at the start.
+///
+/// It is a keystroke interceptor, which gpui runs before all key bindings.
+/// A binding cannot do it: a multi-line text box, such as the replacement
+/// text, binds Tab to indent, and that binding is the deepest one. The
+/// popup window's gpui-kit `Root` also binds Tab, to its own focus order.
+/// Outside the boxes of the order (the YAML box, for example), Tab works as
+/// before.
+pub fn init(cx: &mut App) {
+    cx.intercept_keystrokes(|ev, window, cx| {
+        let k = &ev.keystroke;
+        let m = k.modifiers;
+        if k.key != "tab" || m.control || m.alt || m.platform {
+            return;
+        }
+        if !ev.context_stack.iter().any(|c| c.contains(KEY_CONTEXT)) {
+            return;
+        }
+        let editors: Vec<_> = EDITORS.with(|e| {
+            let mut e = e.borrow_mut();
+            e.retain(|w| w.upgrade().is_some());
+            e.iter().filter_map(WeakEntity::upgrade).collect()
+        });
+        for view in editors {
+            if view.update(cx, |v, cx| v.tab_move(m.shift, window, cx)) {
+                cx.stop_propagation();
+                return;
+            }
+        }
+    })
+    .detach();
 }
 
 /// A step that would drop unsaved edits. It waits until the user saves or
@@ -66,9 +123,10 @@ enum Pending {
 /// the request there.
 ///
 /// `near` is the screen rectangle of the popup, when the request comes from
-/// the popup. The editor then opens compact, without the list, with its top
-/// left corner where the popup was, on the same monitor. It stays hidden
-/// until it is in place, so it never shows up somewhere else first.
+/// the popup. The editor then opens with its list where the popup was, on
+/// the same monitor, and the form to the right of the list. So the popup's
+/// list seems to grow a form. The window stays hidden until it is in place,
+/// so it never shows up somewhere else first.
 pub fn open(
     handle: &mut Option<WindowHandle<EditorView>>,
     base: PathBuf,
@@ -81,9 +139,8 @@ pub fn open(
     if let Some(h) = handle {
         let req = request.clone();
         let shown = h.update(cx, |view, window, cx| {
-            if near.is_some() {
-                view.compact = true;
-            } else if view.compact {
+            view.quick = near.is_some();
+            if view.compact {
                 view.toggle_list(window, cx);
             }
             view.request(req, window, cx);
@@ -93,14 +150,13 @@ pub fn open(
             return;
         }
     }
-    let compact = near.is_some();
-    let width = if compact { COMPACT_W } else { FULL_W };
-    // The window opens hidden and shows up only in its place: next to the
-    // popup, where it was last time, or in the middle of the monitor with
-    // the mouse.
+    let quick = near.is_some();
+    // The window opens hidden and shows up only in its place: where the
+    // popup was, where it was last time, or in the middle of the monitor
+    // with the mouse.
     let place = place.or_else(|| Some(full_place()));
     let options = WindowOptions {
-        window_bounds: Some(WindowBounds::centered(size(px(width), px(WINDOW_H)), cx)),
+        window_bounds: Some(WindowBounds::centered(size(px(FULL_W), px(WINDOW_H)), cx)),
         titlebar: Some(TitlebarOptions { title: Some("snip editor".into()), ..Default::default() }),
         focus: false,
         show: false,
@@ -108,7 +164,7 @@ pub fn open(
         ..Default::default()
     };
     let opened = cx.open_window(options, move |window, cx| {
-        cx.new(|cx| EditorView::new(base, reload, request, compact, place, window, cx))
+        cx.new(|cx| EditorView::new(base, reload, request, quick, place, false, window, cx))
     });
     match opened {
         Ok(h) => *handle = Some(h),
@@ -129,6 +185,18 @@ struct Current {
 }
 
 /// The inputs of one variable parameter.
+/// The drag of a text area's resize handle, with the key of the area.
+struct AreaResize(SharedString);
+
+/// The drag shows nothing under the mouse: the area itself changes height.
+struct NoPreview;
+
+impl Render for NoPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
+
 enum ParamInput {
     Line(Entity<InputState>),
     Area(Entity<TextareaState>),
@@ -161,6 +229,13 @@ pub struct EditorView {
     hwnd: Option<Handle>,
     /// Without the list, for a quick edit from the popup.
     compact: bool,
+    /// The editor lives in the popup window. See [`EditorView::embedded`].
+    embedded: bool,
+    /// The window came from the popup. It does not store its rectangle.
+    quick: bool,
+    /// The popup trigger of the last request from the popup, such as `;;`.
+    /// The list ranks its search the way the popup does.
+    prefix: String,
     search: Entity<InputState>,
     all: Vec<Snippet>,
     shown: Vec<usize>,
@@ -202,18 +277,39 @@ pub struct EditorView {
     title: String,
     list_scroll: ScrollHandle,
     form_scroll: ScrollHandle,
+    /// The heights the user gave the text areas by dragging their handles,
+    /// by area key. They last while the window is open.
+    area_heights: HashMap<SharedString, Pixels>,
     /// The focus of the window itself, for keys when no box has the focus.
     focus: FocusHandle,
+    /// A load does not move the focus: the holder's list keeps it. See
+    /// [`EditorView::preview`].
+    keep_focus: bool,
     _subs: Vec<Subscription>,
 }
 
 impl EditorView {
+    /// An editor inside another view's window, without its list: the popup
+    /// shows its own list beside it. It never moves, titles or closes the
+    /// window. To close, it emits [`EditorEvent::Close`].
+    pub fn embedded(
+        base: PathBuf,
+        reload: Rc<dyn Fn()>,
+        request: Request,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new(base, reload, request, true, None, true, window, cx)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn new(
         base: PathBuf,
         reload: Rc<dyn Fn()>,
         request: Request,
-        compact: bool,
+        quick: bool,
         place: Option<Rect>,
+        embedded: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -232,7 +328,7 @@ impl EditorView {
             }),
         ];
         let hwnd = match HasWindowHandle::window_handle(window).map(|h| h.as_raw()) {
-            Ok(RawWindowHandle::Win32(h)) => Some(Handle(h.hwnd.get())),
+            Ok(RawWindowHandle::Win32(h)) if !embedded => Some(Handle(h.hwnd.get())),
             _ => None,
         };
         let (ws, status, status_error) = match Workspace::open(Some(base)) {
@@ -243,7 +339,10 @@ impl EditorView {
             ws,
             reload,
             hwnd,
-            compact,
+            compact: embedded,
+            quick,
+            embedded,
+            prefix: String::new(),
             search,
             all: Vec::new(),
             shown: Vec::new(),
@@ -272,12 +371,17 @@ impl EditorView {
             title: String::new(),
             list_scroll: ScrollHandle::new(),
             form_scroll: ScrollHandle::new(),
+            area_heights: HashMap::new(),
             focus: cx.focus_handle(),
+            keep_focus: false,
             _subs: subs,
         };
         // The close button of the title bar asks first, like Esc.
         let weak = cx.entity().downgrade();
-        window.on_window_should_close(cx, move |_, cx| weak.update(cx, |view, cx| view.may_close(cx)).unwrap_or(true));
+        EDITORS.with(|e| e.borrow_mut().push(weak.clone()));
+        if !embedded {
+            window.on_window_should_close(cx, move |_, cx| weak.update(cx, |view, cx| view.may_close(cx)).unwrap_or(true));
+        }
         view.refresh_list(cx);
         view.load(request, window, cx);
         view.front(place);
@@ -285,13 +389,23 @@ impl EditorView {
     }
 
     /// Whether the YAML differs from the file.
-    fn dirty(&self, cx: &App) -> bool {
+    pub fn dirty(&self, cx: &App) -> bool {
         self.current.is_some() && self.yaml_text(cx).trim_end() != self.saved_yaml.trim_end()
     }
 
     /// Shows a request, but asks first if that drops unsaved edits.
     pub fn request(&mut self, request: Request, window: &mut Window, cx: &mut Context<Self>) {
         self.go(Pending::Request(request), window, cx);
+    }
+
+    /// Like [`EditorView::request`], but the focus stays where it is: Up and
+    /// Down in the holder's list show each snippet while the list keeps the
+    /// keys. With unsaved edits, the Save / Discard bar asks first, and its
+    /// answer then loads as usual.
+    pub fn preview(&mut self, request: Request, window: &mut Window, cx: &mut Context<Self>) {
+        self.keep_focus = true;
+        self.go(Pending::Request(request), window, cx);
+        self.keep_focus = false;
     }
 
     /// Runs `step` now, or keeps it for the Save / Discard bar when there
@@ -326,10 +440,10 @@ impl EditorView {
         true
     }
 
-    /// Stores the window rectangle for the next start. A compact window
-    /// is a quick edit next to the popup, so it does not count.
+    /// Stores the window rectangle for the next start. A window from the
+    /// popup is a quick edit where the popup was, so it does not count.
     fn remember_rect(&self) {
-        let (Some(h), false) = (self.hwnd, self.compact) else { return };
+        let (Some(h), false) = (self.hwnd, self.quick) else { return };
         if let Some(r) = focus::window_rect(h) {
             // A minimized window sits at -32000.
             if r.left > -30000 && r.width() > 200 && r.height() > 200 {
@@ -356,6 +470,9 @@ impl EditorView {
     /// Shows or hides the snippet list. The window grows or shrinks by the
     /// width of the list.
     fn toggle_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.embedded {
+            return;
+        }
         self.compact = !self.compact;
         let mut s = window.bounds().size;
         s.width = if self.compact { s.width - px(LIST_W) } else { s.width + px(LIST_W) };
@@ -405,6 +522,21 @@ impl EditorView {
             .filter(|(_, s)| q.is_empty() || matches_query(s, &q))
             .map(|(i, _)| i)
             .collect();
+        // The popup's order: exact triggers first, then triggers that start
+        // with the search. The sort is stable, so file order stays within a
+        // rank.
+        if !q.is_empty() {
+            let all = &self.all;
+            let prefix = self.prefix.as_str();
+            self.shown.sort_by_cached_key(|&i| {
+                let s = &all[i];
+                popup_core::data::trigger_rank(
+                    s.triggers.iter().map(String::as_str).chain(s.regex.as_deref()),
+                    &q,
+                    prefix,
+                )
+            });
+        }
         cx.notify();
     }
 
@@ -427,7 +559,11 @@ impl EditorView {
                     }
                 }
             }
-            Request::Find { trigger, label } => {
+            Request::Find { trigger, label, keyword, prefix } => {
+                // The list shows the popup's search, in the popup's order.
+                self.prefix = prefix;
+                self.file_filter = None;
+                self.search.update(cx, |s, cx| s.set_value(keyword.trim().to_string(), window, cx));
                 // The list may be older than the engine's snippets.
                 self.refresh_list(cx);
                 // The popup joins several triggers with two spaces.
@@ -438,6 +574,15 @@ impl EditorView {
                     .find(|s| same(s) && s.label.as_deref().unwrap_or("") == label)
                     .or_else(|| self.all.iter().find(|s| same(s)))
                     .map(|s| (s.file.clone(), s.index));
+                // The editor's search looks at less text than the popup's.
+                // If it misses the snippet, the whole list shows.
+                if let Some((file, index)) = &found {
+                    let hit = self.shown.iter().any(|&i| &self.all[i].file == file && self.all[i].index == *index);
+                    if !hit {
+                        self.search.update(cx, |s, cx| s.set_value("", window, cx));
+                        self.filter(cx);
+                    }
+                }
                 match found {
                     Some((file, index)) => self.open_snippet(&file, index, window, cx),
                     None => {
@@ -477,6 +622,10 @@ impl EditorView {
         // no snippet is open.
         self.tab = 0;
         self.confirm_close = false;
+        if self.keep_focus {
+            cx.notify();
+            return;
+        }
         match &self.inputs {
             Some(inputs) => inputs.body.update(cx, |s, cx| s.focus(window, cx)),
             None if !self.compact => self.search.update(cx, |s, cx| s.focus(window, cx)),
@@ -900,26 +1049,25 @@ impl EditorView {
             }
             (true, "enter") => {
                 if !self.dirty(cx) || self.save(window, cx) {
-                    self.remember_rect();
-                    window.remove_window();
+                    if self.embedded {
+                        cx.emit(EditorEvent::Done);
+                    } else {
+                        self.close(window, cx);
+                    }
                 }
             }
+            (true, "f") if self.embedded => cx.emit(EditorEvent::FocusList),
             (true, "n") => self.request(Request::New { trigger: None }, window, cx),
             (false, k @ ("up" | "down")) if self.search_focused(window, cx) => self.list_step(k == "down", window, cx),
             (false, "enter") if self.search_focused(window, cx) => match &self.inputs {
                 Some(inputs) => inputs.body.update(cx, |s, cx| s.focus(window, cx)),
                 None => self.list_step(true, window, cx),
             },
-            (true, "f") => {
+            (true, "f") if !self.embedded => {
                 if self.compact {
                     self.toggle_list(window, cx);
                 }
                 self.search.update(cx, |s, cx| s.focus(window, cx));
-            }
-            (false, "tab") => {
-                if !self.tab_move(m.shift, window, cx) {
-                    return;
-                }
             }
             (_, "escape") => return,
             _ => {
@@ -969,6 +1117,15 @@ impl EditorView {
         order
     }
 
+    /// Puts the cursor in the form: in the replacement text, or on the
+    /// editor itself when no snippet is open.
+    pub fn focus_form(&self, window: &mut Window, cx: &mut Context<Self>) {
+        match &self.inputs {
+            Some(inputs) => inputs.body.update(cx, |s, cx| s.focus(window, cx)),
+            None => window.focus(&self.focus, cx),
+        }
+    }
+
     /// Tab or Shift+Tab (`back`): moves the focus to the next or previous
     /// box. Returns false when the focus is not in a box of the order, so
     /// the key goes on (to the YAML box, for example).
@@ -981,6 +1138,16 @@ impl EditorView {
         true
     }
 
+    /// Esc from the holder of an embedded editor: closes like Esc in the
+    /// form. With unsaved edits, the first call only warns.
+    pub fn try_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.may_close(cx) {
+            self.close(window, cx);
+        } else {
+            self.focus_form(window, cx);
+        }
+    }
+
     /// Esc closes the window. With unsaved edits, the first Esc only warns.
     /// It runs after the inputs, so a menu that Esc closes keeps the window.
     fn on_escape(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -989,6 +1156,17 @@ impl EditorView {
         }
         cx.stop_propagation();
         if self.may_close(cx) {
+            self.close(window, cx);
+        }
+    }
+
+    /// Closes the window, or asks the holder of an embedded editor to
+    /// remove it.
+    fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.embedded {
+            cx.emit(EditorEvent::Close);
+        } else {
+            self.remember_rect();
             window.remove_window();
         }
     }
@@ -1191,6 +1369,57 @@ impl EditorView {
             .child(div().flex_1().min_w_0().child(el))
     }
 
+    /// A text area with a handle below it. Dragging the handle sets the
+    /// height of the area, which scrolls when its text is taller.
+    fn resizable_area(
+        &self,
+        key: impl Into<SharedString>,
+        default_h: f32,
+        state: &Entity<TextareaState>,
+        theme: &component::Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        const HANDLE_H: f32 = 8.0;
+        let key: SharedString = key.into();
+        let h = self.area_heights.get(&key).copied().unwrap_or(px(default_h));
+        let drag_key = key.clone();
+        let grip = theme.muted_foreground.opacity(0.5);
+        let grip_hover = theme.muted_foreground;
+        div()
+            .flex()
+            .flex_col()
+            .on_drag_move(cx.listener(move |this, e: &DragMoveEvent<AreaResize>, _, cx| {
+                if e.drag(cx).0 != drag_key {
+                    return;
+                }
+                let h = (e.event.position.y - e.bounds.top() - px(HANDLE_H)).clamp(px(40.0), px(2000.0));
+                this.area_heights.insert(drag_key.clone(), h);
+                cx.notify();
+            }))
+            .child(Textarea::new(state).small().h(h))
+            .child(
+                div()
+                    .id(SharedString::from(format!("resize-{key}")))
+                    .h(px(HANDLE_H))
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_row_resize()
+                    .group("grip")
+                    .child(
+                        div()
+                            .w(px(36.0))
+                            .h(px(3.0))
+                            .rounded_full()
+                            .bg(grip)
+                            .group_hover("grip", move |s| s.bg(grip_hover)),
+                    )
+                    .on_drag(AreaResize(key), |_, _, _, cx| cx.new(|_| NoPreview)),
+            )
+            .into_any_element()
+    }
+
     fn render_empty(&self, theme: &component::Theme) -> Option<AnyElement> {
         if self.inputs.is_some() {
             return None;
@@ -1291,16 +1520,19 @@ impl EditorView {
                     },
                 ))
             });
-            let params = inp.params.iter().map(|(path, _, input)| {
+            let bool_boxes: Vec<_> = bool_boxes.collect();
+            let params: Vec<_> = inp.params.iter().map(|(path, _, input)| {
                 let el = match input {
                     ParamInput::Line(s) => Input::new(s).small().into_any_element(),
-                    ParamInput::Area(s) => Textarea::new(s).small().h(px(64.0)).into_any_element(),
+                    ParamInput::Area(s) => {
+                        self.resizable_area(format!("var-{vi}-{}", path.join(".")), 64.0, s, theme, cx)
+                    }
                     ParamInput::YamlOnly => {
                         div().h(px(24.0)).flex().items_center().text_sm().text_color(muted).child("Edit this value in the YAML below.").into_any_element()
                     }
                 };
                 row(path.last().unwrap(), el)
-            });
+            }).collect();
             div()
                 .flex()
                 .flex_col()
@@ -1331,6 +1563,7 @@ impl EditorView {
                 .children(params)
                 .into_any_element()
         });
+        let vars: Vec<_> = vars.collect();
         let add_var = icon("add-var".into(), IconName::Plus, "Add a variable").on_click(cx.listener(|this, _, window, cx| {
             this.edit_form(window, cx, |f| {
                 let name = format!("var{}", f.vars.len() + 1);
@@ -1362,7 +1595,7 @@ impl EditorView {
             .gap_2()
             .when(!has_regex, |d| d.child(row("Triggers", triggers.into_any_element())))
             .when(has_regex, |d| d.child(row("Regex", Input::new(&inputs.regex).small().into_any_element())))
-            .child(row(output_title(&form.output), Textarea::new(&inputs.body).small().h(px(140.0)).into_any_element()))
+            .child(row(output_title(&form.output), self.resizable_area("body", 140.0, &inputs.body, theme, cx)))
             .child(row("Label", Input::new(&inputs.label).small().into_any_element()))
             .child(row("Variables", variables.into_any_element()))
             .children(others)
@@ -1404,12 +1637,12 @@ impl EditorView {
             .flex_col()
             .gap_3()
             .when(form.regex.is_empty(), |d| d.child(row("Regex", Input::new(&inputs.regex).small().into_any_element())))
-            .child(row("Search terms", Textarea::new(&inputs.search_terms).small().h(px(48.0)).into_any_element()))
+            .child(row("Search terms", self.resizable_area("search_terms", 48.0, &inputs.search_terms, theme, cx)))
             .child(line_row("Output key", output.into_any_element()))
             .child(line_row("Word", flags.into_any_element()))
             .when(form.propagate_case, |d| d.child(line_row("Case style", upper.into_any_element())))
             .child(line_row("Insert by", force.into_any_element()))
-            .child(row("Comments", Textarea::new(&inputs.comments).small().h(px(48.0)).into_any_element()))
+            .child(row("Comments", self.resizable_area("comments", 48.0, &inputs.comments, theme, cx)))
             .into_any_element()
     }
 
@@ -1529,7 +1762,7 @@ impl Render for EditorView {
                 name.unwrap_or_else(|| "new snippet".into())
             ),
         };
-        if title != self.title {
+        if title != self.title && !self.embedded {
             window.set_window_title(&title);
             self.title = title;
         }
@@ -1570,13 +1803,15 @@ impl Render for EditorView {
                     .px_2()
                     .pt_1()
                     .child(div().flex_1().child(tabs))
-                    .child(
-                        Button::new("list")
-                            .label(if self.compact { "Show list" } else { "Hide list" })
-                            .ghost()
-                            .xsmall()
-                            .on_click(cx.listener(|this, _, window, cx| this.toggle_list(window, cx))),
-                    ),
+                    .when(!self.embedded, |d| {
+                        d.child(
+                            Button::new("list")
+                                .label(if self.compact { "Show list" } else { "Hide list" })
+                                .ghost()
+                                .xsmall()
+                                .on_click(cx.listener(|this, _, window, cx| this.toggle_list(window, cx))),
+                        )
+                    }),
             )
             .children(self.render_pending(&theme, cx))
             .child(
@@ -1599,6 +1834,7 @@ impl Render for EditorView {
             .bg(theme.background)
             .text_color(theme.foreground)
             .track_focus(&self.focus)
+            .key_context(KEY_CONTEXT)
             .capture_key_down(cx.listener(Self::on_key))
             .on_key_down(cx.listener(Self::on_escape))
             .when(!self.compact, |d| d.child(self.render_list(&theme, cx)))
@@ -1671,11 +1907,12 @@ fn save_error(e: &SnipError) -> String {
     }
 }
 
-/// The compact window rectangle for a popup at `near`: the same top left
-/// corner, moved inside the work area of that monitor.
+/// The window rectangle for a popup at `near`: the list starts at the
+/// popup's top left corner, and the form is to its right. The rectangle
+/// moves inside the work area of that monitor.
 fn place_near(near: Rect) -> Rect {
     let (work, scale) = place::monitor_at(near.left, near.top);
-    let w = ((COMPACT_W * scale).round() as i32).min(work.width());
+    let w = ((FULL_W * scale).round() as i32).min(work.width());
     let h = ((WINDOW_H * scale).round() as i32).min(work.height());
     let left = near.left.min(work.right - w).max(work.left);
     let top = near.top.min(work.bottom - h).max(work.top);

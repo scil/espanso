@@ -40,14 +40,26 @@ use espanso_render::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
+use snip_core::priority::{self, Origins};
+
 use crate::data::Entry;
-use crate::form::{Form, Preview};
+use crate::form::{Form, PickItem, Preview};
 
 /// Shows a form to the user and waits for the answer. The engine calls it
 /// on its own thread, while it renders a snippet.
 pub trait Ask {
     /// The typed values by field name, or `None` if the user canceled.
     fn ask(&self, form: Form) -> Option<HashMap<String, String>>;
+
+    /// Shows a list and returns the index of the picked item, or `None` if
+    /// the user canceled. `snip` shows it in the popup. The default shows
+    /// a choice form with the titles.
+    fn pick(&self, items: Vec<PickItem>) -> Option<usize> {
+        let titles: Vec<String> = items.iter().map(|i| i.title.clone()).collect();
+        let mut answer = self.ask(Form::choice(titles.clone()))?;
+        let title = answer.remove(crate::form::CHOICE_FIELD)?;
+        titles.iter().position(|t| *t == title)
+    }
 }
 
 /// Cancels every form, for tests and for callers without a UI.
@@ -141,6 +153,9 @@ impl Trigger {
 /// the next keys: they either continue a longer trigger or expand this one.
 struct Pending {
     chosen: MatchResult<i32>,
+    /// Other matches with the same trigger and the same priority as
+    /// `chosen`. If there are any, the user picks one from a list.
+    ties: Vec<MatchResult<i32>>,
     app: App,
     /// Keys typed after the trigger that still fit a longer trigger.
     extra: String,
@@ -167,6 +182,9 @@ pub struct Engine {
     /// Every plain trigger with its match id, in load order.
     triggers: Vec<Trigger>,
     pending: Option<Pending>,
+    /// Source file and priority of each match. When matches share a
+    /// trigger, the lowest priority wins.
+    origins: Origins,
 }
 
 impl Engine {
@@ -186,6 +204,11 @@ impl Engine {
         }
         let configs: &'static dyn ConfigStore = Box::leak(configs);
         let store: &'static dyn MatchStore = Box::leak(store);
+
+        let origins = Origins::load(base, store);
+        for p in &origins.problems {
+            crate::log::line(&format!("config problem in {}: {}", p.file, p.message));
+        }
 
         let paths: Vec<String> = configs.get_all_match_paths().into_iter().collect();
         let all: Vec<&'static Match> = store.query(&paths).matches;
@@ -264,6 +287,7 @@ impl Engine {
             undo: None,
             triggers,
             pending: None,
+            origins,
         })
     }
 
@@ -320,26 +344,31 @@ impl Engine {
                 p.extra.push(c);
                 let typed = format!("{}{}", typed_trigger(&p.chosen), p.extra);
                 let active = self.active_ids(&p.app);
-                if let Some(id) = self.triggers.iter().find(|t| t.equals(&typed) && active.contains(&t.id)).map(|t| t.id) {
-                    let left = p.chosen.left_separator.clone();
-                    let chosen = MatchResult {
-                        id,
+                let left = p.chosen.left_separator.clone();
+                let same: Vec<MatchResult<i32>> = self
+                    .triggers
+                    .iter()
+                    .filter(|t| t.equals(&typed) && active.contains(&t.id))
+                    .map(|t| MatchResult {
+                        id: t.id,
                         trigger: format!("{}{typed}", left.as_deref().unwrap_or("")),
-                        left_separator: left,
+                        left_separator: left.clone(),
                         right_separator: None,
                         vars: HashMap::new(),
-                    };
+                    })
+                    .collect();
+                if let Some((chosen, ties)) = self.rank(same) {
                     if self.extends(&typed, &p.app) {
-                        self.pending = Some(Pending { chosen, app: p.app, extra: String::new() });
+                        self.pending = Some(Pending { chosen, ties, app: p.app, extra: String::new() });
                         return None;
                     }
-                    return self.finish(chosen, &p.app, "");
+                    return self.finish(chosen, ties, &p.app, "");
                 }
                 if self.extends(&typed, &p.app) {
                     self.pending = Some(p);
                     return None;
                 }
-                self.finish(p.chosen, &p.app, &p.extra)
+                self.finish(p.chosen, p.ties, &p.app, &p.extra)
             }
         }
     }
@@ -375,18 +404,67 @@ impl Engine {
         let config = self.configs.active(&props);
         let set = self.store.query(config.match_paths());
         let active: HashSet<i32> = set.matches.iter().map(|m| m.id).collect();
-        let mut valid = results.into_iter().filter(|r| active.contains(&r.id));
-        let chosen = valid.next()?;
-        let others = valid.count();
-        if others > 0 {
-            crate::log::line(&format!("expand: {} other matches for the trigger, took the first", others));
+        let valid: Vec<MatchResult<i32>> = results.into_iter().filter(|r| active.contains(&r.id)).collect();
+        let count = valid.len();
+        let (chosen, ties) = self.rank(valid)?;
+        if count > 1 {
+            crate::log::line(&format!(
+                "expand: {count} matches for the trigger, best match {} with priority {}, {} ties",
+                chosen.id,
+                self.origins.priority(chosen.id),
+                ties.len()
+            ));
         }
         if self.extends(typed_trigger(&chosen), app) {
             crate::log::line(&format!("expand: match {} waits, a longer trigger starts the same", chosen.id));
-            self.pending = Some(Pending { chosen, app: app.clone(), extra: String::new() });
+            self.pending = Some(Pending { chosen, ties, app: app.clone(), extra: String::new() });
             return None;
         }
-        self.finish(chosen, app, "")
+        self.finish(chosen, ties, app, "")
+    }
+
+    /// Splits valid results into the strongest one and the others with the
+    /// same priority, both in load order. Weaker results are dropped.
+    fn rank(&self, results: Vec<MatchResult<i32>>) -> Option<(MatchResult<i32>, Vec<MatchResult<i32>>)> {
+        let best = priority::best(results.iter().map(|r| r.id), &self.origins)?;
+        let level = self.origins.priority(best);
+        let mut seen = HashSet::new();
+        let mut equal = results
+            .into_iter()
+            .filter(|r| self.origins.priority(r.id) == level && seen.insert(r.id));
+        let chosen = equal.next()?;
+        Some((chosen, equal.collect()))
+    }
+
+    /// With ties, asks the user to pick one match from a list, as espanso
+    /// does. `None` if the user canceled.
+    fn pick(&self, chosen: MatchResult<i32>, ties: Vec<MatchResult<i32>>) -> Option<MatchResult<i32>> {
+        if ties.is_empty() {
+            return Some(chosen);
+        }
+        let mut all = vec![chosen];
+        all.extend(ties);
+        let labels = choice_labels(all.iter().map(|r| self.by_id.get(&r.id).copied()));
+        let items = all
+            .iter()
+            .zip(labels)
+            .map(|(r, title)| PickItem {
+                title,
+                detail: match self.by_id.get(&r.id).map(|m| &m.effect) {
+                    Some(MatchEffect::Text(t)) => one_line(&t.replace, 120),
+                    _ => String::new(),
+                },
+                badge: self.origins.by_id.get(&r.id).map_or_else(String::new, |o| {
+                    let name = o.file.rsplit('/').next().unwrap_or(&o.file);
+                    match o.index {
+                        Some(i) => format!("{name}:{}", i + 1),
+                        None => name.to_string(),
+                    }
+                }),
+            })
+            .collect();
+        let index = self.forms.ask.pick(items)?;
+        (index < all.len()).then(|| all.swap_remove(index))
     }
 
     /// Whether a trigger waits for the next key. If no key comes in time,
@@ -398,7 +476,7 @@ impl Engine {
     /// Expands a waiting trigger, with the keys typed after it.
     pub fn flush(&mut self) -> Option<Expansion> {
         let p = self.pending.take()?;
-        self.finish(p.chosen, &p.app, &p.extra)
+        self.finish(p.chosen, p.ties, &p.app, &p.extra)
     }
 
     /// Whether `typed` is the start of a longer trigger of the active
@@ -420,11 +498,21 @@ impl Engine {
 
     /// Expands a chosen match. `extra` holds keys typed after the trigger:
     /// they are erased with it and typed again after the text.
-    fn finish(&mut self, chosen: MatchResult<i32>, app: &App, extra: &str) -> Option<Expansion> {
+    fn finish(
+        &mut self,
+        chosen: MatchResult<i32>,
+        ties: Vec<MatchResult<i32>>,
+        app: &App,
+        extra: &str,
+    ) -> Option<Expansion> {
         let props = AppProperties { title: app.title.as_deref(), class: None, exec: app.exec.as_deref() };
         let config = self.configs.active(&props);
         let set = self.store.query(config.match_paths());
         self.history.clear();
+        let Some(chosen) = self.pick(chosen, ties) else {
+            crate::log::line("expand: the list of matches was canceled");
+            return None;
+        };
         let m = *self.by_id.get(&chosen.id)?;
         let typed = typed_trigger(&chosen).to_string();
         let body = match self.render(m, Some(&chosen.trigger), chosen.vars, config.as_ref(), &set) {
@@ -460,7 +548,16 @@ impl Engine {
             class: None,
             exec: app.exec.as_deref(),
         };
-        let config = self.configs.active(&props);
+        // The popup lists the matches of every configuration. A match that is
+        // not active here renders with the first configuration that holds
+        // it, so it sees the global variables of its own files.
+        let holds = |c: &std::sync::Arc<dyn Config>| self.store.query(c.match_paths()).matches.iter().any(|x| x.id == id);
+        let active = self.configs.active(&props);
+        let config = if holds(&active) {
+            active
+        } else {
+            self.configs.configs().into_iter().find(holds).unwrap_or(active)
+        };
         let set = self.store.query(config.match_paths());
         let body = self.render(m, None, HashMap::new(), config.as_ref(), &set)?;
         let (text, lefts) = cursor_hint(&body);
@@ -553,6 +650,49 @@ impl Engine {
                 ))
             })
             .collect()
+    }
+}
+
+/// One unique line per match for the list that picks a match: its label,
+/// or the first line of its text. A repeated line gets ` (2)`, ` (3)`.
+fn choice_labels<'a>(matches: impl Iterator<Item = Option<&'a Match>>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for m in matches {
+        let base = m
+            .and_then(|m| {
+                m.label.clone().filter(|l| !l.trim().is_empty()).or_else(|| match &m.effect {
+                    MatchEffect::Text(t) => {
+                        t.replace.lines().map(str::trim).find(|l| !l.is_empty()).map(str::to_string)
+                    }
+                    MatchEffect::Image(i) => Some(i.path.clone()),
+                    MatchEffect::None => None,
+                })
+            })
+            .unwrap_or_else(|| "(empty)".to_string());
+        let base: String = if base.chars().count() > 80 {
+            base.chars().take(79).chain(std::iter::once('\u{2026}')).collect()
+        } else {
+            base
+        };
+        let mut label = base.clone();
+        let mut n = 1;
+        while out.contains(&label) {
+            n += 1;
+            label = format!("{base} ({n})");
+        }
+        out.push(label);
+    }
+    out
+}
+
+/// Text on one line: line breaks become spaces, runs of spaces shrink, and
+/// text longer than `max` characters ends with `…`.
+fn one_line(text: &str, max: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() > max {
+        flat.chars().take(max - 1).chain(std::iter::once('\u{2026}')).collect()
+    } else {
+        flat
     }
 }
 
@@ -698,12 +838,8 @@ impl FormProvider for Forms {
 
 impl ChoiceSelector for Forms {
     fn show(&self, choices: &[Choice]) -> ChoiceSelectorResult {
-        let labels: Vec<String> = choices.iter().map(|c| c.label.to_string()).collect();
-        let picked = self
-            .ask
-            .ask(Form::choice(labels))
-            .and_then(|mut v| v.remove(crate::form::CHOICE_FIELD))
-            .and_then(|label| choices.iter().find(|c| c.label == label));
+        let items = choices.iter().map(|c| PickItem::new(c.label)).collect();
+        let picked = self.ask.pick(items).and_then(|i| choices.get(i));
         match picked {
             Some(c) => ChoiceSelectorResult::Success(c.id.to_string()),
             None => ChoiceSelectorResult::Aborted,
@@ -935,6 +1071,21 @@ matches:
         assert_eq!(typed_in(&mut e, " :hi", notepad).map(|x| x.text), Some("hello".into()));
     }
 
+    #[test]
+    fn popup_renders_a_match_of_another_application() {
+        let np = "global_vars:\n  - name: who\n    type: echo\n    params:\n      echo: \"pad\"\nmatches:\n  - trigger: \":np\"\n    replace: \"note{{who}}\"\n";
+        let (mut e, _d) = engine(&[
+            ("match/base.yml", BASE),
+            ("match/_np.yml", np),
+            ("config/np.yml", "filter_exec: \"notepad.exe\"\nextra_includes:\n  - \"../match/_np.yml\"\n"),
+        ]);
+        let other = App { exec: Some(r"C:\Tools\other.exe".into()), title: None };
+        let entry = e.entries().into_iter().find(|x| x.trigger == ":np").unwrap();
+        // The match is not active in `other`, so its own configuration
+        // renders it, with the global variable of its file.
+        assert_eq!(e.render_by_id(entry.id, &other).unwrap().text, "notepad");
+    }
+
     const PREFIX: &str = r#"
 matches:
   - trigger: ";su"
@@ -993,5 +1144,58 @@ matches:
         let entry = e.entries().into_iter().find(|x| x.trigger == ":cur").unwrap();
         let x = e.render_by_id(entry.id, &App::default()).unwrap();
         assert_eq!((x.text.as_str(), x.lefts), ("abc", 2));
+    }
+
+    #[test]
+    fn lower_priority_wins_a_shared_trigger() {
+        let base = "matches:\n  - trigger: \":x\"\n    replace: \"base\"\n  - trigger: \":y\"\n    replace: \"y1\"\n  - trigger: \":y\"\n    replace: \"y2\"\n";
+        let mine = "snip:\n  priority: personal\nmatches:\n  - trigger: \":x\"\n    replace: \"mine\"\n";
+        let (mut e, _d) = engine(&[("match/base.yml", base), ("match/mine.yml", mine)]);
+        assert_eq!(typed(&mut e, ":x").map(|x| x.text), Some("mine".into()));
+        // Equal priorities open a list. The test default cancels it.
+        assert_eq!(typed(&mut e, " :y"), None);
+        // The next trigger still works.
+        assert_eq!(typed(&mut e, " :x").map(|x| x.text), Some("mine".into()));
+    }
+
+    #[test]
+    fn a_tie_asks_which_match() {
+        let base = "matches:\n  - trigger: \":y\"\n    replace: \"one\"\n    label: \"First\"\n  - trigger: \":y\"\n    replace: \"\\n  two\\nmore\"\n  - trigger: \":y\"\n    replace: \"two\"\n";
+        // A weaker match in a file with a weaker priority.
+        let weak = "snip:\n  priority: package\nmatches:\n  - trigger: \":y\"\n    replace: \"weak\"\n";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("config")).unwrap();
+        std::fs::create_dir_all(dir.path().join("match")).unwrap();
+        std::fs::write(dir.path().join("config/default.yml"), "").unwrap();
+        std::fs::write(dir.path().join("match/base.yml"), base).unwrap();
+        std::fs::write(dir.path().join("match/weak.yml"), weak).unwrap();
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let answers = HashMap::from([("choice".to_string(), "two (2)".to_string())]);
+        let mut e = Engine::load_with(dir.path(), Box::new(Answer(answers, seen.clone()))).unwrap();
+        assert_eq!(text(typed(&mut e, ":y")), Some((2, "two".into(), 0)));
+        let seen = seen.lock().unwrap();
+        assert!(seen[0].is_choice());
+        // The weaker match is not in the list.
+        let crate::form::Kind::Choice { values } = &seen[0].fields[0].kind else { panic!() };
+        assert_eq!(values, &["First", "two", "two (2)"]);
+    }
+
+    #[test]
+    fn a_match_priority_has_no_effect() {
+        // Only the file priority counts, so `mine` wins.
+        let base = "matches:\n  - trigger: \":x\"\n    replace: \"base\"\n    snip:\n      priority: -1\n";
+        let mine = "snip:\n  priority: personal\nmatches:\n  - trigger: \":x\"\n    replace: \"mine\"\n";
+        let (mut e, _d) = engine(&[("match/base.yml", base), ("match/mine.yml", mine)]);
+        assert_eq!(typed(&mut e, ":x").map(|x| x.text), Some("mine".into()));
+    }
+
+    #[test]
+    fn priority_applies_after_a_wait() {
+        let base = "matches:\n  - trigger: \";s\"\n    replace: \"short\"\n  - trigger: \";sa\"\n    replace: \"base\"\n";
+        let mine = "snip:\n  priority: personal\nmatches:\n  - trigger: \";sa\"\n    replace: \"mine\"\n";
+        let (mut e, _d) = engine(&[("match/base.yml", base), ("match/mine.yml", mine)]);
+        assert_eq!(typed(&mut e, ";s"), None);
+        assert!(e.waiting());
+        assert_eq!(typed(&mut e, "a").map(|x| x.text), Some("mine".into()));
     }
 }

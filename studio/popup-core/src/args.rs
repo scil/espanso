@@ -26,6 +26,10 @@ use crate::focus::{Insert, LongText};
 /// - `--prefix-wait-ms N`: a typed trigger that is also the start of a longer
 ///   trigger waits for the next key. If no key comes in N ms (default 500),
 ///   the short trigger expands.
+/// - `--tab accept|move|ignore`: what Tab does in the resident popup.
+///   `accept` (default) inserts the selected row, as Enter does. `move`
+///   selects the next row, and Shift+Tab the previous one. `ignore` leaves
+///   Tab to the application, and the popup closes.
 #[derive(Debug, Clone)]
 pub struct Args {
     pub type_text: bool,
@@ -39,6 +43,7 @@ pub struct Args {
     pub log: Option<PathBuf>,
     pub insert: Insert,
     pub prefix_wait: std::time::Duration,
+    pub tab: crate::hook::TabKey,
 }
 
 impl Default for Args {
@@ -55,6 +60,7 @@ impl Default for Args {
             log: None,
             insert: Insert::default(),
             prefix_wait: std::time::Duration::from_millis(500),
+            tab: crate::hook::TabKey::default(),
         }
     }
 }
@@ -98,6 +104,10 @@ impl Args {
                         out.prefix_wait = std::time::Duration::from_millis(n);
                     }
                 }
+                "--tab" => match it.next().as_deref().and_then(crate::hook::TabKey::parse) {
+                    Some(t) => out.tab = t,
+                    None => eprintln!("--tab wants accept, move or ignore"),
+                },
                 "--trigger" => {
                     if let Some(t) = it.next().filter(|t| !t.is_empty()) {
                         out.trigger = t;

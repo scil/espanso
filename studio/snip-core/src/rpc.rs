@@ -125,6 +125,7 @@ fn dispatch(ws: &Workspace, method: &str, p: &Value) -> Result<Value, Failure> {
             json!({ "deleted": true })
         }
         "validate" => json!({ "problems": ws.validate()? }),
+        "conflicts" => json!({ "conflicts": ws.conflicts()? }),
         _ => return Err(Failure::Method),
     };
     Ok(out)

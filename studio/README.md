@@ -49,6 +49,7 @@ printf 'trigger: ":hi"\nreplace: "hello"\n' | snipctl create match/base.yml
 printf 'trigger: ":hi"\nreplace: "hello!"\n' | snipctl update match/base.yml 3 <hash>
 snipctl delete match/base.yml 3 <hash>
 snipctl validate
+snipctl conflicts
 ```
 
 ## JSON-RPC
@@ -66,7 +67,8 @@ snipctl validate
 | `snippets.create` | `file`, `yaml` | the new snippet with `yaml` |
 | `snippets.update` | `file`, `index`, `hash`, `yaml` | the updated snippet with `yaml` |
 | `snippets.delete` | `file`, `index`, `hash` | `{deleted: true}` |
-| `validate` | none | `{problems}` from espanso's loader |
+| `validate` | none | `{problems}` from espanso's loader, plus bad `snip.priority` values, match-level priorities and shared triggers |
+| `conflicts` | none | `{conflicts}`: each trigger that several active matches share, winner first, with file, index and priority |
 
 Paths are relative to the base folder, use `/`, and must be `.yml` or `.yaml` files under `match/` or `config/`.
 

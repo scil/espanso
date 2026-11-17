@@ -61,7 +61,7 @@ The program ignores its own injected key presses, as now. espanso no longer runs
 
 Differences from the design:
 
-- If more than one match is valid for a trigger, the engine takes the first one and writes a log line. The popup does not open with those matches.
+- If more than one match is valid for a trigger, the engine takes the one with the lowest `snip` priority. If several share the lowest priority, the engine shows them as a pick list in the popup, as espanso shows a list. It writes a log line. See [Pick lists in the popup](#pick-lists-in-the-popup). See [XPTEMPLATE.md](XPTEMPLATE.md#priority).
 - The hook passes each key press to the engine through a callback of `hook::start`. A key that the popup swallows (Up, Down, Enter on a result) reaches the engine as a reset, because the application never got it. Injected input from another program also resets the engine.
 - Tab is now its own key in the hook. In the popup, it still picks the selected result, like Enter.
 - In the popup, a snippet with an image shows an `image` badge. Enter on it shows a note and inserts nothing.
@@ -87,7 +87,7 @@ Decisions, agreed on 2026-11-15:
 How it works:
 
 - espanso's `FormExtension` and `ChoiceExtension` call a provider while they render. The new module `popup_core::form` turns their parameters into a `Form`: the layout split into text parts and `[[field]]` parts, and the fields in layout order. It copies espanso's `convert_fields`. A field has the type `text`, `choice` or `list`, and a `default`. A `text` field can be `multiline`. A `choice` or `list` field has `values`: a list, or a string split into lines, trimmed, without empty lines. A field that has no entry in `fields` is a single-line text field.
-- A `choice` variable becomes a form with one `choice` field and no text parts. The provider returns the `id` of the chosen value.
+- A `choice` variable becomes a pick list in the popup since 2026-11-16 (see [Pick lists in the popup](#pick-lists-in-the-popup)). The provider returns the `id` of the chosen value.
 - The engine thread renders, so the provider runs there. It records the foreground window, finds the caret, sends the form to the UI thread and waits for the answer. After the answer, it gives the focus back to the recorded window. Then the render goes on, and the engine erases the trigger and inserts the text as for any expansion.
 - The UI opens a new window for each form, below the caret line. If there is no room below, the window opens above the line. The window never covers the caret line. It shows the layout as a sentence, with an input box in place of each field, and below it a preview of the result: the snippet text with the form values filled in.
 - A `choice` or `list` field shows its value as text. When it has the focus, it becomes a filter box. A list of its values then opens at the bottom of the form, like the popup list.
@@ -119,6 +119,31 @@ snip waits instead:
 - If the next keys make the longer trigger, the longer one expands. If it is also the start of a longer trigger, it waits again.
 - If a key fits no longer trigger, the short trigger expands. The engine erases the trigger and the keys after it, and types the keys again after the text.
 - If no key comes in 500 ms, the short trigger expands. `--prefix-wait-ms` changes this time.
+- While the `;;` popup is open, the wait does not end by time, because the user picks in the popup. For example, `;;anki` shows `;;anki` and `;;anki2`, and neither expands on its own. The next key decides: Enter inserts the selected snippet, and a key that fits no longer trigger expands the short one. If the popup closes without a key, nothing expands.
 - Backspace erases a key after the trigger and keeps the wait. A Backspace on the trigger itself, an arrow key or a click ends the wait, and nothing expands.
 
-espanso's matcher drops its state when a trigger matches. So while a trigger waits, the engine compares the typed keys with its own list of triggers. It follows the `propagate_case` setting of each trigger for upper and lower case.
+When a trigger matches, espanso's matcher drops its state. So while a trigger waits, the engine compares the typed keys with its own list of triggers. It follows the `propagate_case` setting of each trigger for upper and lower case.
+
+## Pick lists in the popup
+
+Added on 2026-11-16. The `;;` popup and the list of a `choice` variable are now one window. You agreed to set aside input methods (IME) in the list for now.
+
+A pick list opens in two cases:
+
+- A `choice` variable.
+- A trigger that several matches share with the same priority (a tie). See [XPTEMPLATE.md](XPTEMPLATE.md#priority).
+
+How it works:
+
+- The engine calls `Ask::pick` with a list of `PickItem` rows: a title, a second line and a badge. The popup shows the title and the badge on one line. For a tie, the title is the match `label` or the first line of its text. The second line is the text. The badge is the file and the match number, for example `_prompts.yml:5`. For a `choice` variable, the title is the value label.
+- `snip` calls `Shared::start_pick`. From then on, the hook swallows every typed character and Backspace. So the text before the caret stays the trigger, and the engine erases the right number of characters. The typed characters still filter the list.
+- The popup opens below the caret with the rows. It looks like the `;;` popup. A pick list replaces an open `;;` session. For example, a tie trigger can start with `;;`.
+- Keys: typing filters, Up and Down move, Enter or Tab picks, Ctrl+1 to Ctrl+9 picks the row with that number, a click on a row picks. Esc, Backspace on an empty filter, or a click outside cancels and leaves the trigger in the text. Any other key cancels and goes through.
+- The engine thread waits for the answer, then ends the hook session and inserts the text.
+
+Limits:
+
+- An input method cannot type into the filter, because the keys never reach a text box.
+- A form with more than one field still opens the form window. Its `choice` and `list` fields keep their own list in that window.
+
+Tests on 2026-11-16: unit tests for the hook's pick mode and for the engine. Not tested by hand yet, because the running `snip` (with administrator rights) holds `target/release/snip.exe`.

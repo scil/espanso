@@ -6,12 +6,15 @@
 //!   folder. Every write is checked with espanso's own loader first.
 //! - [`rpc`] serves the same operations as JSON-RPC for non-Rust frontends.
 //! - [`portability`] tells whether a match can be exported to other programs.
+//! - [`priority`] finds the file of each match and picks the winner when
+//!   matches share a trigger.
 //! - [`matchedit`] reads one match into form fields and writes a form
 //!   change back as the smallest text change.
 
 pub mod error;
 pub mod matchedit;
 pub mod portability;
+pub mod priority;
 pub mod rpc;
 pub mod workspace;
 pub mod yamlfile;

@@ -19,7 +19,9 @@
 //!   [`Shared::deactivate`]. The Ctrl key alone changes nothing.
 //! - Any other key, a key with Ctrl, Alt or Win, or a mouse click outside the
 //!   popup cancels and goes through.
-//! - A mouse click inside the popup is swallowed ([`HookEvent::Click`]).
+//! - A mouse click inside the popup is swallowed ([`HookEvent::Click`]). A
+//!   right click asks to edit the row under the mouse
+//!   ([`HookEvent::EditClick`]).
 //!
 //! The hook ignores injected input, so the popup's own Backspace and paste
 //! events and espanso's expansions never extend the keyword. Injected input
@@ -35,6 +37,19 @@
 //!
 //! While a window of this process has the focus (a form), the hook ignores
 //! all input, because the user types into that window.
+//!
+//! A `.` as the first keyword character repeats the last search: the hook
+//! swallows the `.` and sends [`HookEvent::Repeat`] with the keyword of the
+//! last session. The UI types that keyword into the application, so the
+//! text before the caret is the trigger and the keyword, as usual.
+//!
+//! The expander can also open the popup as a pick list, for a trigger that
+//! several matches share or for a `choice` variable ([`Shared::start_pick`]).
+//! Then the hook swallows every typed character and Backspace, so the text
+//! before the caret stays the trigger that the expander will erase. The
+//! characters still filter the list ([`HookEvent::Query`]). Up, Down, Enter,
+//! Tab, Escape and clicks work as in the popup. Backspace on an empty
+//! keyword cancels. Any other key cancels and goes through.
 //!
 //! The hook sees every key press. It keeps only the last few characters and
 //! the current keyword in memory, and it logs nothing.
@@ -53,14 +68,24 @@ pub enum HookEvent {
     Open,
     /// The keyword after the trigger changed.
     Query(String),
+    /// `.` as the first keyword character: the keyword of the last search
+    /// is now the keyword. The UI types it into the application.
+    Repeat(String),
     /// Up (-1) or Down (+1).
     Move(i32),
-    /// A mouse button went down inside the popup. The hook swallows the
-    /// click, so the target window keeps focus.
+    /// The left or middle mouse button went down inside the popup. The hook
+    /// swallows the click, so the target window keeps focus.
     Click,
+    /// The right mouse button went down inside the popup: edit the row
+    /// under the mouse. The hook swallows the click. The hook stays active
+    /// until the UI calls [`Shared::deactivate`].
+    EditClick,
     /// Enter or Tab with at least one result. The hook stays active until the
     /// UI calls [`Shared::deactivate`].
     Accept { keyword: String },
+    /// Ctrl+1 to Ctrl+9: insert the row with that number (0-based here).
+    /// The hook stays active until the UI calls [`Shared::deactivate`].
+    AcceptRow(usize),
     /// Ctrl+E or Right with at least one result: edit the selected snippet. The hook
     /// stays active until the UI calls [`Shared::deactivate`].
     Edit,
@@ -75,6 +100,8 @@ pub enum HookEvent {
 #[derive(Default)]
 pub struct Shared {
     active: AtomicBool,
+    /// The session is a pick list from the expander, not a `;;` search.
+    pick: AtomicBool,
     paused: AtomicBool,
     results: AtomicUsize,
     popup: Mutex<Option<Rect>>,
@@ -104,8 +131,19 @@ impl Shared {
     /// Ends the current session. The hook goes back to watching for the
     /// trigger.
     pub fn deactivate(&self) {
+        self.pick.store(false, Ordering::Relaxed);
         self.active.store(false, Ordering::Relaxed);
         self.set_popup_rect(None);
+    }
+    /// Starts a pick-list session. It replaces an open `;;` session.
+    pub fn start_pick(&self) {
+        self.set_results(0);
+        self.pick.store(true, Ordering::Relaxed);
+        self.active.store(true, Ordering::Relaxed);
+    }
+    /// Whether the session is a pick list.
+    pub fn is_picking(&self) -> bool {
+        self.pick.load(Ordering::Relaxed)
     }
 }
 
@@ -124,6 +162,7 @@ pub fn start(
     trigger: &str,
     shared: Arc<Shared>,
     allow_injected: bool,
+    tab: TabKey,
     on_input: Option<OnInput>,
 ) -> Receiver<(Instant, HookEvent)> {
     let (tx, rx) = std::sync::mpsc::channel();
@@ -131,11 +170,11 @@ pub fn start(
     #[cfg(windows)]
     {
         let trigger: Vec<char> = trigger.chars().collect();
-        std::thread::spawn(move || win::run(Machine::new(trigger, shared, tx, on_input)));
+        std::thread::spawn(move || win::run(Machine::new(trigger, shared, tx, on_input).with_tab(tab)));
     }
     #[cfg(not(windows))]
     {
-        let _ = (trigger, shared, tx, on_input);
+        let _ = (trigger, shared, tx, on_input, tab);
     }
     rx
 }
@@ -150,6 +189,8 @@ pub enum Key {
     Right,
     Enter,
     Tab,
+    /// Tab with Shift.
+    ShiftTab,
     Escape,
     /// Shift or Caps Lock alone. They never change the state.
     Modifier,
@@ -157,8 +198,37 @@ pub enum Key {
     Ctrl,
     /// Ctrl with a letter key, and no Alt or Win. The letter is lowercase.
     CtrlLetter(char),
+    /// Ctrl with a digit key 1 to 9 on the main keyboard, and no Alt or Win.
+    CtrlDigit(u8),
     /// Any other key, or any key with Ctrl, Alt or Win.
     Other,
+}
+
+/// What Tab does while the popup is open (`--tab`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TabKey {
+    /// Tab inserts the selected row, as Enter does. Shift+Tab does the
+    /// same. This is the default.
+    #[default]
+    Accept,
+    /// Tab selects the next row and Shift+Tab the previous one, as Down
+    /// and Up do.
+    Move,
+    /// The popup does not use Tab. Tab goes to the application and closes
+    /// the popup, as other keys do.
+    Ignore,
+}
+
+impl TabKey {
+    /// `accept`, `move` or `ignore`.
+    pub fn parse(s: &str) -> Option<TabKey> {
+        match s {
+            "accept" => Some(TabKey::Accept),
+            "move" => Some(TabKey::Move),
+            "ignore" => Some(TabKey::Ignore),
+            _ => None,
+        }
+    }
 }
 
 /// What the hook does with a key press.
@@ -175,12 +245,23 @@ pub struct Machine {
     recent: Vec<char>,
     active: bool,
     keyword: String,
+    /// The keyword of the last search that had one. `.` repeats it.
+    last: String,
+    /// The machine handles a pick-list session.
+    in_pick: bool,
     shared: Arc<Shared>,
     tx: Sender<(Instant, HookEvent)>,
     on_input: Option<OnInput>,
+    tab: TabKey,
 }
 
 impl Machine {
+    /// Sets what Tab does in the popup.
+    pub fn with_tab(mut self, tab: TabKey) -> Self {
+        self.tab = tab;
+        self
+    }
+
     pub fn new(
         trigger: Vec<char>,
         shared: Arc<Shared>,
@@ -192,9 +273,12 @@ impl Machine {
             recent: Vec::new(),
             active: false,
             keyword: String::new(),
+            last: String::new(),
+            in_pick: false,
             shared,
             tx,
             on_input,
+            tab: TabKey::default(),
         }
     }
 
@@ -208,8 +292,16 @@ impl Machine {
         let _ = self.tx.send((Instant::now(), ev));
     }
 
+    /// Keeps the keyword of a `;;` session that ends, for `.`.
+    fn remember(&mut self) {
+        if !self.in_pick && !self.keyword.is_empty() {
+            self.last = self.keyword.clone();
+        }
+    }
+
     fn cancel(&mut self, reason: &str) {
         crate::log::line(&format!("hook cancel: {reason}"));
+        self.remember();
         self.active = false;
         self.keyword.clear();
         self.recent.clear();
@@ -231,7 +323,17 @@ impl Machine {
             (_, Key::Enter) => Some(Input::Char('\n')),
             (_, Key::Tab) => Some(Input::Char('\t')),
             (_, Key::Modifier | Key::Ctrl) => None,
-            (_, Key::Up | Key::Down | Key::Right | Key::Escape | Key::Other | Key::CtrlLetter(_)) => {
+            (
+                _,
+                Key::Up
+                | Key::Down
+                | Key::Right
+                | Key::ShiftTab
+                | Key::Escape
+                | Key::Other
+                | Key::CtrlLetter(_)
+                | Key::CtrlDigit(_),
+            ) => {
                 Some(Input::Reset)
             }
         };
@@ -242,8 +344,23 @@ impl Machine {
     }
 
     fn popup_key(&mut self, key: Key) -> Verdict {
+        if self.shared.is_picking() {
+            if !self.in_pick {
+                self.in_pick = true;
+                self.active = false;
+                self.keyword.clear();
+                self.recent.clear();
+            }
+            return self.pick_key(key);
+        }
+        if self.in_pick {
+            self.in_pick = false;
+            self.keyword.clear();
+            self.recent.clear();
+        }
         // The UI may end the session (after an insert, or with no results).
         if self.active && !self.shared.active.load(Ordering::Relaxed) {
+            self.remember();
             self.active = false;
             self.keyword.clear();
             self.recent.clear();
@@ -282,8 +399,38 @@ impl Machine {
         }
     }
 
+    /// Ctrl+1 to Ctrl+9 picks a numbered row, if the list has it.
+    fn digit_row(&mut self, n: u8) -> bool {
+        let row = usize::from(n.max(1)) - 1;
+        if row < self.shared.results.load(Ordering::Relaxed) {
+            crate::log::line(&format!("hook accept row {n}"));
+            self.emit(HookEvent::AcceptRow(row));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Tab and Shift+Tab as the key they act as in the popup, by `--tab`.
+    fn tab_as(&self, key: Key) -> Key {
+        match (key, self.tab) {
+            (Key::Tab | Key::ShiftTab, TabKey::Accept) => Key::Enter,
+            (Key::Tab, TabKey::Move) => Key::Down,
+            (Key::ShiftTab, TabKey::Move) => Key::Up,
+            (Key::Tab | Key::ShiftTab, TabKey::Ignore) => Key::Other,
+            _ => key,
+        }
+    }
+
     fn active_key(&mut self, key: Key) -> Verdict {
-        match key {
+        match self.tab_as(key) {
+            Key::Char('.') if self.keyword.is_empty() && !self.last.is_empty() => {
+                crate::log::line("hook repeat the last search");
+                self.keyword = self.last.clone();
+                self.emit(HookEvent::Repeat(self.keyword.clone()));
+                Verdict::Swallow
+            }
+            Key::CtrlDigit(n) if self.digit_row(n) => Verdict::Swallow,
             Key::Char(c) => {
                 self.keyword.push(c);
                 self.emit(HookEvent::Query(self.keyword.clone()));
@@ -307,7 +454,8 @@ impl Machine {
                 self.emit(HookEvent::Move(1));
                 Verdict::Swallow
             }
-            Key::Enter | Key::Tab => {
+            // `tab_as` already turned Tab into another key.
+            Key::Enter | Key::Tab | Key::ShiftTab => {
                 if self.shared.results.load(Ordering::Relaxed) > 0 {
                     crate::log::line("hook accept");
                     self.emit(HookEvent::Accept { keyword: self.keyword.clone() });
@@ -332,7 +480,7 @@ impl Machine {
                 self.emit(HookEvent::New { keyword: self.keyword.clone() });
                 Verdict::Swallow
             }
-            Key::CtrlLetter(_) => {
+            Key::CtrlLetter(_) | Key::CtrlDigit(_) => {
                 self.cancel("ctrl shortcut");
                 Verdict::Pass
             }
@@ -347,6 +495,52 @@ impl Machine {
         }
     }
 
+    /// A key in a pick-list session. Typing filters the list but never
+    /// reaches the application.
+    fn pick_key(&mut self, key: Key) -> Verdict {
+        match self.tab_as(key) {
+            Key::Char(c) => {
+                self.keyword.push(c);
+                self.emit(HookEvent::Query(self.keyword.clone()));
+                Verdict::Swallow
+            }
+            Key::Backspace => {
+                if self.keyword.pop().is_some() {
+                    self.emit(HookEvent::Query(self.keyword.clone()));
+                } else {
+                    self.cancel("backspace on empty pick keyword");
+                }
+                Verdict::Swallow
+            }
+            Key::Up => {
+                self.emit(HookEvent::Move(-1));
+                Verdict::Swallow
+            }
+            Key::Down => {
+                self.emit(HookEvent::Move(1));
+                Verdict::Swallow
+            }
+            // `tab_as` already turned Tab into another key.
+            Key::Enter | Key::Tab | Key::ShiftTab => {
+                if self.shared.results.load(Ordering::Relaxed) > 0 {
+                    crate::log::line("hook pick accept");
+                    self.emit(HookEvent::Accept { keyword: self.keyword.clone() });
+                }
+                Verdict::Swallow
+            }
+            Key::Escape => {
+                self.cancel("escape in pick list");
+                Verdict::Swallow
+            }
+            Key::Modifier | Key::Ctrl => Verdict::Pass,
+            Key::CtrlDigit(n) if self.digit_row(n) => Verdict::Swallow,
+            Key::Right | Key::CtrlLetter(_) | Key::CtrlDigit(_) | Key::Other => {
+                self.cancel("other key in pick list");
+                Verdict::Pass
+            }
+        }
+    }
+
     /// Another program injected a key, for example espanso while it expands
     /// a trigger that the user typed in full. The text at the caret is no
     /// longer what the hook counted, so an open popup closes.
@@ -354,14 +548,19 @@ impl Machine {
         // The text before the caret changed in a way that the expander cannot
         // see.
         self.pass_on(Input::Reset);
-        if self.active && self.shared.active.load(Ordering::Relaxed) {
+        if (self.active || self.shared.is_picking()) && self.shared.active.load(Ordering::Relaxed) {
             self.cancel("injected input from another program");
         }
     }
 
-    /// A mouse button went down at a screen point.
-    pub fn click(&mut self, x: i32, y: i32) -> Verdict {
+    /// A mouse button went down at a screen point. `right` is the right
+    /// button.
+    pub fn click(&mut self, x: i32, y: i32, right: bool) -> Verdict {
         self.pass_on(Input::Reset);
+        if self.shared.is_picking() {
+            self.in_pick = true;
+            self.active = true;
+        }
         if self.active && !self.shared.active.load(Ordering::Relaxed) {
             self.active = false;
             self.keyword.clear();
@@ -374,7 +573,7 @@ impl Machine {
             x >= r.left && x < r.right && y >= r.top && y < r.bottom
         });
         if inside {
-            self.emit(HookEvent::Click);
+            self.emit(if right { HookEvent::EditClick } else { HookEvent::Click });
             Verdict::Swallow
         } else {
             self.cancel("click outside the popup");
@@ -516,7 +715,7 @@ mod win {
                         let verdict = MACHINE.with(|m| {
                             m.borrow_mut()
                                 .as_mut()
-                                .map(|m| m.click(ms.pt.x, ms.pt.y))
+                                .map(|m| m.click(ms.pt.x, ms.pt.y, msg == WM_RBUTTONDOWN))
                                 .unwrap_or(Verdict::Pass)
                         });
                         if verdict == Verdict::Swallow {
@@ -560,6 +759,11 @@ mod win {
         if ctrl && !alt && !win && (0x41..=0x5A).contains(&vk) {
             return Key::CtrlLetter((vk as u8 + 32) as char);
         }
+        // Ctrl with a digit: the virtual key codes of 1 to 9 are their
+        // ASCII codes.
+        if ctrl && !alt && !win && (0x31..=0x39).contains(&vk) {
+            return Key::CtrlDigit(vk as u8 - 0x30);
+        }
         if ctrl || alt || win {
             return Key::Other;
         }
@@ -579,7 +783,7 @@ mod win {
             return Key::Enter;
         }
         if is(VK_TAB) {
-            return Key::Tab;
+            return if down(VK_SHIFT.0 as i32) { Key::ShiftTab } else { Key::Tab };
         }
         if is(VK_ESCAPE) {
             return Key::Escape;
@@ -648,6 +852,136 @@ mod tests {
         assert_eq!(
             events(&rx),
             vec![HookEvent::Open, HookEvent::Query("s".into()), HookEvent::Query("si".into())]
+        );
+    }
+
+    #[test]
+    fn tab_follows_its_setting() {
+        let open = |tab: TabKey| {
+            let (m, rx, shared) = machine();
+            let mut m = m.with_tab(tab);
+            typed(&mut m, "//a");
+            shared.set_results(3);
+            let _ = events(&rx);
+            (m, rx, shared)
+        };
+
+        let (mut m, rx, _) = open(TabKey::Accept);
+        assert_eq!(m.key(Key::Tab), Verdict::Swallow);
+        assert_eq!(events(&rx), vec![HookEvent::Accept { keyword: "a".into() }]);
+
+        let (mut m, rx, _) = open(TabKey::Move);
+        assert_eq!(m.key(Key::Tab), Verdict::Swallow);
+        assert_eq!(m.key(Key::ShiftTab), Verdict::Swallow);
+        assert_eq!(events(&rx), vec![HookEvent::Move(1), HookEvent::Move(-1)]);
+
+        let (mut m, rx, shared) = open(TabKey::Ignore);
+        assert_eq!(m.key(Key::Tab), Verdict::Pass);
+        assert_eq!(events(&rx), vec![HookEvent::Cancel]);
+        assert!(!shared.is_active());
+    }
+
+    #[test]
+    fn pick_list_swallows_typing() {
+        let (mut m, rx, shared) = machine();
+        typed(&mut m, "ab");
+        shared.start_pick();
+        assert_eq!(m.key(Key::Char('x')), Verdict::Swallow);
+        assert_eq!(m.key(Key::Char('y')), Verdict::Swallow);
+        assert_eq!(m.key(Key::Backspace), Verdict::Swallow);
+        assert_eq!(m.key(Key::Down), Verdict::Swallow);
+        // No results: Enter does nothing, and the application never gets it.
+        assert_eq!(m.key(Key::Enter), Verdict::Swallow);
+        shared.set_results(2);
+        assert_eq!(m.key(Key::Enter), Verdict::Swallow);
+        assert_eq!(
+            events(&rx),
+            vec![
+                HookEvent::Query("x".into()),
+                HookEvent::Query("xy".into()),
+                HookEvent::Query("x".into()),
+                HookEvent::Move(1),
+                HookEvent::Accept { keyword: "x".into() },
+            ]
+        );
+        // The UI ends the session. The trigger opens the popup again.
+        shared.deactivate();
+        typed(&mut m, "//");
+        assert_eq!(events(&rx), vec![HookEvent::Open]);
+    }
+
+    #[test]
+    fn dot_repeats_the_last_search() {
+        let (mut m, rx, shared) = machine();
+        // No search yet: `.` is a keyword character.
+        typed(&mut m, "//.");
+        assert_eq!(events(&rx), vec![HookEvent::Open, HookEvent::Query(".".into())]);
+        m.key(Key::Escape);
+        typed(&mut m, "//exp");
+        shared.set_results(1);
+        m.key(Key::Enter);
+        // The UI ends the session after the insert.
+        shared.deactivate();
+        events(&rx);
+        typed(&mut m, "//");
+        assert_eq!(m.key(Key::Char('.')), Verdict::Swallow);
+        assert_eq!(events(&rx), vec![HookEvent::Open, HookEvent::Repeat("exp".into())]);
+        // Typing goes on from the repeated keyword.
+        typed(&mut m, "l");
+        assert_eq!(events(&rx), vec![HookEvent::Query("expl".into())]);
+        // A canceled search counts too. `.` later in a keyword is a character.
+        m.key(Key::Escape);
+        typed(&mut m, "//a.");
+        assert_eq!(events(&rx).last(), Some(&HookEvent::Query("a.".into())));
+        m.key(Key::Escape);
+        typed(&mut m, "//.");
+        assert_eq!(events(&rx).last(), Some(&HookEvent::Repeat("a.".into())));
+    }
+
+    #[test]
+    fn ctrl_digit_picks_a_numbered_row() {
+        let (mut m, rx, shared) = machine();
+        typed(&mut m, "//a");
+        shared.set_results(3);
+        assert_eq!(m.key(Key::CtrlDigit(2)), Verdict::Swallow);
+        assert_eq!(events(&rx).last(), Some(&HookEvent::AcceptRow(1)));
+        // No row 5: the shortcut goes to the application.
+        assert_eq!(m.key(Key::CtrlDigit(5)), Verdict::Pass);
+        assert_eq!(events(&rx), vec![HookEvent::Cancel]);
+        // The same in a pick list.
+        shared.start_pick();
+        shared.set_results(2);
+        assert_eq!(m.key(Key::CtrlDigit(1)), Verdict::Swallow);
+        assert_eq!(events(&rx), vec![HookEvent::AcceptRow(0)]);
+    }
+
+    #[test]
+    fn pick_list_cancels() {
+        let (mut m, rx, shared) = machine();
+        shared.start_pick();
+        assert_eq!(m.key(Key::Backspace), Verdict::Swallow);
+        assert!(!shared.is_active() && !shared.is_picking());
+        shared.start_pick();
+        assert_eq!(m.key(Key::Escape), Verdict::Swallow);
+        shared.start_pick();
+        assert_eq!(m.key(Key::Other), Verdict::Pass);
+        assert_eq!(events(&rx), vec![HookEvent::Cancel, HookEvent::Cancel, HookEvent::Cancel]);
+    }
+
+    #[test]
+    fn pick_list_replaces_a_popup_session() {
+        let (mut m, rx, shared) = machine();
+        typed(&mut m, "//ab");
+        shared.start_pick();
+        assert_eq!(m.key(Key::Char('z')), Verdict::Swallow);
+        assert_eq!(
+            events(&rx),
+            vec![
+                HookEvent::Open,
+                HookEvent::Query("a".into()),
+                HookEvent::Query("ab".into()),
+                HookEvent::Query("z".into()),
+            ]
         );
     }
 
@@ -781,9 +1115,11 @@ mod tests {
         let (mut m, rx, shared) = machine();
         typed(&mut m, "//");
         shared.set_popup_rect(Some(Rect { left: 0, top: 0, right: 10, bottom: 10 }));
-        assert_eq!(m.click(5, 5), Verdict::Swallow);
+        assert_eq!(m.click(5, 5, false), Verdict::Swallow);
         assert_eq!(events(&rx).last(), Some(&HookEvent::Click));
-        assert_eq!(m.click(50, 5), Verdict::Pass);
+        assert_eq!(m.click(5, 5, true), Verdict::Swallow);
+        assert_eq!(events(&rx).last(), Some(&HookEvent::EditClick));
+        assert_eq!(m.click(50, 5, true), Verdict::Pass);
         assert_eq!(events(&rx).last(), Some(&HookEvent::Cancel));
     }
 }

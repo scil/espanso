@@ -219,13 +219,15 @@ pub fn hide(h: Handle) {
     let _ = h;
 }
 
-/// Marks `h` so that Windows never gives it focus, also when the user clicks
-/// it. The popup of the resident mode uses it, like an input method window.
-pub fn set_no_activate(h: Handle) {
+/// With `on`, marks `h` so that Windows never gives it focus, also when the
+/// user clicks it. The popup of the resident mode uses it, like an input
+/// method window. Without `on`, `h` can take focus again: the popup does
+/// that while it shows an edit form.
+pub fn set_no_activate(h: Handle, on: bool) {
     #[cfg(windows)]
-    crate::win::set_no_activate(h);
+    crate::win::set_no_activate(h, on);
     #[cfg(not(windows))]
-    let _ = h;
+    let _ = (h, on);
 }
 
 /// Sends `n` Backspace key presses to the focused window.

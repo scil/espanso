@@ -125,38 +125,67 @@ impl Entry {
 /// user types the keyword after it, so the ranking compares the query with
 /// each trigger without that prefix:
 ///
-/// 0. A trigger starts with `prefix` and the rest starts with the query
-///    (`;;doc` for `doc`).
-/// 1. A trigger starts with the query.
-/// 2. A trigger contains the query.
-/// 3. Any other hit.
+/// 0. A trigger is the typed text in full: `prefix` and the query (`;;doc`
+///    for `doc`). See [`exact_trigger`].
+/// 1. A trigger starts with `prefix` and the rest starts with the query
+///    (`;;docx` for `doc`).
+/// 2. A trigger starts with the query.
+/// 3. A trigger contains the query.
+/// 4. Any other hit.
 ///
 /// An empty query lists the triggers that start with `prefix` first.
 pub fn filter(entries: &[Entry], query: &str, prefix: &str) -> Vec<usize> {
     let q = query.trim().to_lowercase();
     let prefix = prefix.to_lowercase();
-    let rank = |e: &Entry| -> u8 {
-        let mut best = 3;
-        for t in e.trigger_lower.split("  ") {
-            let r = match t.strip_prefix(prefix.as_str()) {
-                Some(rest) if !prefix.is_empty() && rest.starts_with(&q) => 0,
-                _ if t.starts_with(&q) => 1,
-                _ if t.contains(&q) => 2,
-                _ => 3,
-            };
-            best = best.min(r);
-        }
-        best
-    };
     let words: Vec<&str> = q.split_whitespace().collect();
     let mut hits: Vec<(u8, usize)> = entries
         .iter()
         .enumerate()
         .filter(|(_, e)| words.iter().all(|w| e.haystack.contains(w)))
-        .map(|(i, e)| (rank(e), i))
+        .map(|(i, e)| (rank_lower(e.trigger_lower.split("  "), &q, &prefix), i))
         .collect();
     hits.sort();
     hits.into_iter().take(MAX_RESULTS).map(|(_, i)| i).collect()
+}
+
+/// The rank of a snippet with these triggers for `query`, as [`filter`]
+/// ranks it: 0 is best, 4 means no trigger fits. The editor list uses it to
+/// show the popup's order.
+pub fn trigger_rank<'a>(triggers: impl IntoIterator<Item = &'a str>, query: &str, prefix: &str) -> u8 {
+    let lower: Vec<String> = triggers.into_iter().map(str::to_lowercase).collect();
+    rank_lower(lower.iter().map(String::as_str), &query.trim().to_lowercase(), &prefix.to_lowercase())
+}
+
+/// [`trigger_rank`] for triggers, query and prefix in lower case.
+fn rank_lower<'a>(triggers: impl IntoIterator<Item = &'a str>, q: &str, prefix: &str) -> u8 {
+    let mut best = 4;
+    for t in triggers {
+        let r = match t.strip_prefix(prefix) {
+            Some(rest) if !prefix.is_empty() && !q.is_empty() && rest == q => 0,
+            Some(rest) if !prefix.is_empty() && rest.starts_with(q) => 1,
+            _ if t.starts_with(q) => 2,
+            _ if t.contains(q) => 3,
+            _ => 4,
+        };
+        best = best.min(r);
+    }
+    best
+}
+
+/// The trigger of `entry` that is exactly the typed text, `prefix` and then
+/// `query`, ignoring case. It is the trigger as written in the match file.
+/// `None` for an empty query or when no trigger is the typed text.
+pub fn exact_trigger<'a>(entry: &'a Entry, query: &str, prefix: &str) -> Option<&'a str> {
+    if query.trim().is_empty() {
+        return None;
+    }
+    let typed = format!("{prefix}{}", query.trim()).to_lowercase();
+    entry
+        .trigger
+        .split("  ")
+        .zip(entry.trigger_lower.split("  "))
+        .find(|(_, lower)| *lower == typed)
+        .map(|(t, _)| t)
 }
 
 #[cfg(test)]
@@ -195,5 +224,15 @@ mod tests {
     fn empty_query_lists_prefix_triggers_first() {
         let e = vec![entry(":a", "a"), entry(";;b", "b"), entry("c", "c"), entry(";;d", "d")];
         assert_eq!(filter(&e, "", ";;"), vec![1, 3, 0, 2]);
+    }
+
+    #[test]
+    fn exact_trigger_comes_first() {
+        // `;;anki2` loads first, but `;;anki` is the typed text in full.
+        let e = vec![entry(";;anki2", "a"), entry(";;x  ;;Anki", "b")];
+        assert_eq!(filter(&e, "anki", ";;"), vec![1, 0]);
+        assert_eq!(exact_trigger(&e[1], "anki", ";;"), Some(";;Anki"));
+        assert_eq!(exact_trigger(&e[0], "anki", ";;"), None);
+        assert_eq!(exact_trigger(&e[0], "", ";;"), None);
     }
 }

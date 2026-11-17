@@ -200,6 +200,29 @@ fn values(value: &Value, trim: Option<&Value>) -> Vec<String> {
     }
 }
 
+/// One row of a pick list in the popup: a match of a tie, or a value of a
+/// `choice` variable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PickItem {
+    /// The first line of the row. Titles of one list are unique.
+    pub title: String,
+    /// The second line, for example the snippet text. Can be empty.
+    pub detail: String,
+    /// A short tag at the right, for example the file. Can be empty.
+    pub badge: String,
+}
+
+impl PickItem {
+    pub fn new(title: impl Into<String>) -> Self {
+        PickItem { title: title.into(), detail: String::new(), badge: String::new() }
+    }
+
+    /// The text that the filter searches.
+    pub fn search_text(&self) -> String {
+        format!("{} {} {}", self.title, self.detail, self.badge)
+    }
+}
+
 /// The values of a list filtered by `query`: indexes of values that hold
 /// every word of the query, ignoring case.
 pub fn filter(values: &[String], query: &str) -> Vec<usize> {

@@ -102,12 +102,18 @@ In Notepad on Windows 11, UI Automation found the exact caret in 16 to 18 ms.
 
 1. You type the trigger, `;;` by default. The popup opens below the caret. It lists the snippets whose triggers start with `;;` first.
 2. You type the keyword. The characters go into the target application, and the popup filters its list after each one. Many triggers start with the popup trigger, so the popup compares the keyword with each snippet trigger without that prefix. For the keyword `doc`, `;;doc` comes first.
-3. Up and Down select a snippet. Enter or Tab inserts it.
+3. Up and Down select a snippet. Enter or Tab inserts it. Ctrl+1 to Ctrl+9 inserts the row with that number. After each typed key, the first row is selected, so Enter or Tab inserts the first row. The `--tab` option changes what Tab does.
+
+`;;.` repeats the last search. If `.` is the first keyword character, snip replaces it with the keyword of the last `;;` search, inserted or not. snip types that keyword into the application, and you can go on typing. Before the first search, `.` is an ordinary keyword character.
+
+Each row has one line: a number for the first nine rows, then the snippet `label`. A snippet without a label shows the start of its text. The rows do not show triggers, but the keyword still matches them.
+
+An exact match is a snippet with a trigger that is the typed text in full, ignoring case. For `;;anki`, the snippet with the trigger `;;anki` is an exact match, and `;;anki2` is not. Exact matches come first. Each one has a colored bar on its left edge, a bold title, and its trigger in a colored badge on the right.
 4. The popup erases the trigger and the keyword with Backspace key presses, then inserts the snippet text as [Inserting text](#inserting-text) describes.
 
 If you type a full espanso trigger, such as `;;doc`, espanso expands it at once and the popup closes. The popup sees espanso's injected key presses and knows that the keyword at the caret is gone.
 
-Ctrl+E or Right opens the selected snippet in the editor. If no snippet matches, Right closes the popup and moves the caret. Ctrl+N opens the editor with a new snippet, and the typed trigger and keyword become its first trigger. Both erase the typed text first (see [EDITOR.md](EDITOR.md)).
+Ctrl+E or Right opens the selected snippet in an edit form. A right click on a row opens that snippet. The popup itself grows to the right and shows the form there, beside its list, and takes focus. A click on another row, or Alt+Up and Alt+Down, opens that row in the form. Tab moves between the boxes of the form. Ctrl+F gives the list the focus, and you type there to search. Up and Down then show each row in the form while the list keeps the focus, and Right puts the cursor in the form. Esc closes the form, and the popup shows only its list, with focus: Enter then inserts, and Esc again closes the popup. If no snippet matches, Right closes the popup and moves the caret. Ctrl+N opens the form with a new snippet, and the typed trigger and keyword become its first trigger. Both erase the typed text first (see [EDITOR.md](EDITOR.md)).
 
 Escape closes the popup. Backspace on an empty keyword, any other key, a key with Ctrl, Alt or Win, and a click outside the popup also close it. If no snippet matches, Enter closes the popup and goes to the application. A click on a row inserts that row.
 
@@ -129,7 +135,7 @@ The insert flags in [Inserting text](#inserting-text) also apply.
 ### How the resident mode works
 
 - `popup_core::hook` installs low-level keyboard and mouse hooks (`WH_KEYBOARD_LL`, `WH_MOUSE_LL`) on a thread of its own. A state machine keeps the last typed characters and the keyword. It has no Windows code, so its tests run anywhere.
-- The hook passes characters and Backspace to the application. It swallows Up, Down, Enter, Tab, Escape, Ctrl+E, Ctrl+N, Right (with a result) and clicks inside the popup, so the application never sees them.
+- The hook passes characters and Backspace to the application. It swallows Up, Down, Enter, Tab (unless `--tab ignore`), Escape, Ctrl+E, Ctrl+N and clicks inside the popup, right clicks too. It also swallows Right with a result, and Ctrl+1 to Ctrl+9 with that row. The application never sees these keys.
 - The hook reads characters with `ToUnicodeEx` in the keyboard layout of the foreground window. Flag 4 keeps dead keys working in the application.
 - The hook ignores injected input for the keyword, so espanso's expansions and the popup's own key presses never extend it. Injected input from another program closes an open popup, because espanso then replaced the text at the caret. The popup marks its own input with `dwExtraInfo = OWN_INPUT`, so `--allow-injected` still ignores it.
 - A controller thread finds the caret for each session, so UI Automation never blocks the hook or the UI thread.
@@ -164,7 +170,7 @@ A test typed `@@sig` with `--trigger @@`, then pressed Enter. The popup erased t
 
 - A program that shows its own completion list, such as a code editor, also reacts to Up, Down and Enter. The hook swallows those keys while the popup is open, so the program's list does not get them.
 - The hook counts the keyword from the key presses. If the application changes the text itself, for example with auto-correction, the Backspace count is wrong.
-- Snippets with an image show the `image` badge. Enter shows a note and inserts nothing. Snippets with a form or a `choice` variable open the form window near the caret (see `EXPANDER.md`).
+- Snippets with an image show the `image` badge. Enter shows a note and inserts nothing. Snippets with a form open the form window near the caret. A `choice` variable opens a pick list in the popup (see `EXPANDER.md`).
 - Windows does not give the keys of an administrator window to the hook of a normal process. If you use an administrator window, such as Cmder, run snip as administrator. `scripts/win/snip.ps1 -Action start` does this with one UAC prompt, and `-Action stop` stops it. A normal process cannot stop a snip that runs as administrator. The script writes the log to `%LOCALAPPDATA%\snip\events.log`.
 - A low-level hook must answer within the system timeout, about 300 ms by default. The hook only updates its state and sends a message, so it answers in microseconds.
 
@@ -179,7 +185,8 @@ Both modes use the same rules. A UTF-16 unit is one character, or half of an emo
 | `--long-text type` | Type long text as key events. The clipboard stays untouched. |
 | `--type-chunk N` | Typing sends N characters per `SendInput` call. The default is 1. |
 | `--type-gap-ms N` | Typing waits N ms between calls. The default is 5. |
-| `--prefix-wait-ms N` | A typed trigger that is also the start of a longer trigger waits N ms for the next key. The default is 500. See `EXPANDER.md`. |
+| `--prefix-wait-ms N` | A typed trigger that is also the start of a longer trigger waits N ms for the next key. The default is 500. While the popup is open, the wait has no time limit. See `EXPANDER.md`. |
+| `--tab accept\|move\|ignore` | What Tab does while the popup is open. `accept` (default) inserts the selected row, as Enter does, and Shift+Tab does the same. `move` selects the next row, and Shift+Tab selects the previous row. `ignore` leaves Tab to the application, and the popup closes. A pick list follows the same setting. |
 
 A paste does not leave the snippet in the clipboard history:
 
