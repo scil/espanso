@@ -34,6 +34,13 @@ pub struct Tray {
 
 const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "snip";
+/// Explorer keeps the on/off state of each `Run` value here (the switch in
+/// Task Manager and in Settings > Apps > Startup). On recent Windows 11
+/// builds, Explorer skips a `Run` value that has no entry here.
+const APPROVED_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
+/// 12 bytes: the first byte 02 means enabled, the other bytes hold the time
+/// of the last change and are zero when nobody switched it off.
+const APPROVED_ON: &str = "020000000000000000000000";
 
 impl Tray {
     /// Creates the icon. `admin` is true when this process already has
@@ -152,29 +159,65 @@ fn quiet(program: &str) -> Command {
     cmd
 }
 
-/// Whether the `Run` key starts snip at sign-in.
+/// Whether Explorer starts snip at sign-in: the `Run` value exists and its
+/// entry under `StartupApproved\Run` says enabled.
 pub fn start_at_sign_in() -> bool {
-    quiet("reg")
+    let run = quiet("reg")
         .args(["query", RUN_KEY, "/v", RUN_VALUE])
         .output()
-        .is_ok_and(|o| o.status.success())
+        .is_ok_and(|o| o.status.success());
+    run && quiet("reg")
+        .args(["query", APPROVED_KEY, "/v", RUN_VALUE])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .is_some_and(|o| approved_enabled(&String::from_utf8_lossy(&o.stdout)))
 }
 
-/// Adds or removes the `Run` value. The value repeats the command line of
-/// this process, so snip starts with the same options.
+/// Reads the output of `reg query` for one `REG_BINARY` value. An even
+/// first byte (02, 06) means enabled, an odd one (03, 07) means disabled.
+fn approved_enabled(reg_output: &str) -> bool {
+    reg_output
+        .lines()
+        .find_map(|l| l.split_once("REG_BINARY"))
+        .and_then(|(_, data)| u8::from_str_radix(data.trim().get(..2)?, 16).ok())
+        .is_some_and(|b| b & 1 == 0)
+}
+
+/// Adds or removes the `Run` value and its `StartupApproved` entry. The
+/// value repeats the command line of this process, so snip starts with the
+/// same options.
 pub fn set_start_at_sign_in(on: bool) -> Result<(), String> {
-    let output = if on {
+    if on {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         let mut line = quote(exe.as_os_str());
         for arg in std::env::args_os().skip(1) {
             line.push(' ');
             line.push_str(&quote(&arg));
         }
-        quiet("reg").args(["add", RUN_KEY, "/v", RUN_VALUE, "/t", "REG_SZ", "/f", "/d"]).arg(line).output()
+        reg(quiet("reg").args(["add", RUN_KEY, "/v", RUN_VALUE, "/t", "REG_SZ", "/f", "/d"]).arg(line))?;
+        reg(quiet("reg").args([
+            "add",
+            APPROVED_KEY,
+            "/v",
+            RUN_VALUE,
+            "/t",
+            "REG_BINARY",
+            "/f",
+            "/d",
+            APPROVED_ON,
+        ]))
     } else {
-        quiet("reg").args(["delete", RUN_KEY, "/v", RUN_VALUE, "/f"]).output()
-    };
-    match output {
+        reg(quiet("reg").args(["delete", RUN_KEY, "/v", RUN_VALUE, "/f"]))?;
+        // The entry may be missing. Explorer ignores an entry without its
+        // `Run` value, so a failure here does no harm.
+        let _ = quiet("reg").args(["delete", APPROVED_KEY, "/v", RUN_VALUE, "/f"]).output();
+        Ok(())
+    }
+}
+
+fn reg(cmd: &mut Command) -> Result<(), String> {
+    match cmd.output() {
         Ok(o) if o.status.success() => Ok(()),
         Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
         Err(e) => Err(e.to_string()),
@@ -224,4 +267,21 @@ pub fn open(path: &Path) -> Result<(), String> {
         }
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::approved_enabled;
+
+    fn query(data: &str) -> String {
+        format!("\r\nHKEY_CURRENT_USER\\StartupApproved\\Run\r\n    snip    REG_BINARY    {data}\r\n\r\n")
+    }
+
+    #[test]
+    fn reads_the_first_byte() {
+        assert!(approved_enabled(&query("020000000000000000000000")));
+        assert!(approved_enabled(&query("060000000000000000000000")));
+        assert!(!approved_enabled(&query("0300000067D879B22B95DC01")));
+        assert!(!approved_enabled("ERROR: not found"));
+    }
 }
