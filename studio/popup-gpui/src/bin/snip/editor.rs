@@ -807,6 +807,10 @@ impl EditorView {
                 }
             }
             (true, "f") => cx.emit(EditorEvent::FocusList),
+            // Left at the start of a box goes back to the list.
+            (false, "left") if !m.modified() && self.caret_at_start(window, cx) => {
+                cx.emit(EditorEvent::FocusList)
+            }
             (true, "n") => self.request(Request::New { trigger: None }, window, cx),
             (_, "escape") => return,
             _ => {
@@ -815,6 +819,48 @@ impl EditorView {
             }
         }
         cx.stop_propagation();
+    }
+
+    /// Whether the focused text box has its caret at the very start, with
+    /// no text selected. False when no box of the form has the focus.
+    fn caret_at_start(&self, window: &Window, cx: &App) -> bool {
+        let line = |s: &Entity<InputState>| {
+            let s = s.read(cx);
+            s.focus_handle(cx).is_focused(window).then(|| s.selected_range() == (0..0))
+        };
+        let area = |s: &Entity<TextareaState>| {
+            let s = s.read(cx);
+            s.focus_handle(cx).is_focused(window).then(|| s.selected_range() == (0..0))
+        };
+        let yaml = self.yaml.read(cx);
+        if yaml.focus_handle(cx).is_focused(window) {
+            return yaml.selected_range() == (0..0);
+        }
+        let Some(inputs) = &self.inputs else { return false };
+        let mut found = [&inputs.comments, &inputs.search_terms, &inputs.body].into_iter().filter_map(area);
+        if let Some(at) = found.next() {
+            return at;
+        }
+        let mut found = inputs.triggers.iter().chain([&inputs.regex, &inputs.label]).filter_map(line);
+        if let Some(at) = found.next() {
+            return at;
+        }
+        for v in &inputs.vars {
+            if let Some(at) = line(&v.name) {
+                return at;
+            }
+            for (_, _, input) in &v.params {
+                let at = match input {
+                    ParamInput::Line(s) => line(s),
+                    ParamInput::Area(s) => area(s),
+                    ParamInput::YamlOnly => None,
+                };
+                if let Some(at) = at {
+                    return at;
+                }
+            }
+        }
+        false
     }
 
     /// The text boxes in Tab order: the boxes of the open form tab, top to
