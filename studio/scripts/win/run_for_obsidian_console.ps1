@@ -19,6 +19,7 @@ switch ($Button) {
     'snip-stop' { & "$PSScriptRoot\snip.ps1" -Action stop; Done }  # stop snip
     # cmd joins cargo's stderr, so PowerShell does not show its progress lines as errors.
     'snip-build' { cmd /c "cargo build --release -p popup-gpui --bin snip 2>&1" | Select-Object -Last 3; Done }  # build snip
+    'snip-rebuild' { & "$PSScriptRoot\snip-rebuild.ps1"; Done }  # quit snip, build release, start it again
     'snip-log' { if (Test-Path $log) { Get-Content $log -Tail 30 } else { "No log at $log" }; Done }  # last 30 log lines
     default { Write-Output "Unknown console button: $Button"; exit 2 }
 }
