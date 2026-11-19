@@ -471,6 +471,7 @@ impl Engine {
                         None => name.to_string(),
                     }
                 }),
+                parent: None,
             })
             .collect();
         let index = self.forms.ask.pick(items)?;
@@ -525,7 +526,7 @@ impl Engine {
         };
         let m = *self.by_id.get(&chosen.id)?;
         let typed = typed_trigger(&chosen).to_string();
-        let body = match self.render(m, Some(&chosen.trigger), chosen.vars, config.as_ref(), &set) {
+        let body = match self.render(m, Some(&chosen.trigger), chosen.vars, config.as_ref(), &set, false) {
             Ok(body) => body,
             Err(e) => {
                 crate::log::line(&format!("expand: match {} not rendered: {e}", m.id));
@@ -552,6 +553,17 @@ impl Engine {
     /// Renders a match for the popup: no trigger, so no case change. The
     /// popup erases its own trigger and keyword.
     pub fn render_by_id(&mut self, id: i32, app: &App) -> Result<Expansion> {
+        self.render_id(id, app, false)
+    }
+
+    /// Renders a match for the popup as a paragraph pick, also if the match
+    /// has no `snip: { pick: many }` key (Ctrl+P in the popup). The match's
+    /// own `checked` setting applies if it has one; else all start checked.
+    pub fn render_paragraphs_by_id(&mut self, id: i32, app: &App) -> Result<Expansion> {
+        self.render_id(id, app, true)
+    }
+
+    fn render_id(&mut self, id: i32, app: &App, paragraphs: bool) -> Result<Expansion> {
         let m = *self.by_id.get(&id).ok_or_else(|| anyhow!("no match with id {id}"))?;
         let props = AppProperties {
             title: app.title.as_deref(),
@@ -569,7 +581,7 @@ impl Engine {
             self.configs.configs().into_iter().find(holds).unwrap_or(active)
         };
         let set = self.store.query(config.match_paths());
-        let body = self.render(m, None, HashMap::new(), config.as_ref(), &set)?;
+        let body = self.render(m, None, HashMap::new(), config.as_ref(), &set, paragraphs)?;
         let (text, lefts) = cursor_hint(&body);
         Ok(Expansion { erase: 0, text, lefts, method: method_of(m), id })
     }
@@ -594,13 +606,17 @@ impl Engine {
         trigger_vars: HashMap<String, String>,
         config: &dyn Config,
         set: &MatchSet<'static>,
+        paragraphs: bool,
     ) -> Result<String> {
         let template =
             self.templates.get(&m.id).ok_or_else(|| anyhow!("only text snippets can expand"))?;
         // The user checks paragraphs first. Only the checked ones render, so
         // a variable that only an unchecked paragraph uses does not run.
-        let picked = match self.origins.picks.get(&m.id) {
-            Some(pick) => Some(self.pick_pieces(&template.body, *pick)?),
+        // `paragraphs` asks for the list also without `snip.pick`.
+        let pick = self.origins.picks.get(&m.id).copied();
+        let pick = pick.or(paragraphs.then_some(Pick { all_checked: true }));
+        let picked = match pick {
+            Some(pick) => Some(self.pick_pieces(&template.body, pick)?),
             None => None,
         };
         let (templates, global_vars) = (self.templates, self.global_vars);
@@ -655,14 +671,22 @@ impl Engine {
         let items = pieces
             .parts
             .iter()
-            .map(|p| {
+            .zip(&pieces.items)
+            .enumerate()
+            .map(|(i, (p, &item))| {
                 let mut lines = p.lines();
                 let first = lines.next().unwrap_or_default();
                 let more = lines.count();
+                // A list item is indented under the lead of its paragraph.
+                let indent = if item { "\u{2003}\u{2003}" } else { "" };
                 PickItem {
-                    title: one_line(first, 120),
+                    title: format!("{indent}{}", one_line(first, 120)),
                     detail: p.clone(),
                     badge: if more > 0 { format!("+{more} lines") } else { String::new() },
+                    // The lead of the paragraph, if the item has one.
+                    parent: (0..i)
+                        .find(|&j| item && pieces.groups[j] == pieces.groups[i])
+                        .filter(|&j| !pieces.items[j]),
                 }
             })
             .collect();
@@ -1317,6 +1341,25 @@ matches:
         let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
         let mut e = Engine::load_with(dir.path(), Box::new(Check(vec![0], seen))).unwrap();
         assert_eq!(typed(&mut e, ":rep").map(|x| x.text), Some("x A!".into()));
+    }
+
+    #[test]
+    fn popup_renders_any_match_as_a_paragraph_pick() {
+        let base = "matches:\n  - trigger: \":rep\"\n    label: rep\n    replace: \"a\\n\\nb\\n\\nc\"\n";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("config")).unwrap();
+        std::fs::create_dir_all(dir.path().join("match")).unwrap();
+        std::fs::write(dir.path().join("config/default.yml"), "").unwrap();
+        std::fs::write(dir.path().join("match/base.yml"), base).unwrap();
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let mut e = Engine::load_with(dir.path(), Box::new(Check(vec![2], seen.clone()))).unwrap();
+        let id = e.entries()[0].id;
+        let app = App::default();
+        // Without Ctrl+P the match has no list.
+        assert_eq!(e.render_by_id(id, &app).unwrap().text, "a\n\nb\n\nc");
+        assert!(seen.lock().unwrap().is_empty());
+        assert_eq!(e.render_paragraphs_by_id(id, &app).unwrap().text, "c");
+        assert_eq!(seen.lock().unwrap()[0].1, [true; 3]);
     }
 
     #[test]

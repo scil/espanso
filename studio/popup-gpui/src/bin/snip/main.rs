@@ -74,7 +74,9 @@ enum ToEngine {
     Key(Input),
     /// The user picked a snippet in the popup. `erase` is the number of
     /// characters of the popup trigger and keyword before the caret.
-    Insert { id: i32, erase: usize },
+    /// With `paragraphs` (Ctrl+P), a list first asks which paragraphs of
+    /// the snippet to insert.
+    Insert { id: i32, erase: usize, paragraphs: bool },
     /// Load the configuration again.
     Reload,
     /// Ctrl+E or Ctrl+N in the popup: erase the popup trigger and the
@@ -212,8 +214,11 @@ fn run_engine(
                     engine = e;
                 }
             }
-            ToEngine::Insert { id, erase } => {
-                match engine.render_by_id(id, &focus::foreground_app()) {
+            ToEngine::Insert { id, erase, paragraphs } => {
+                let app = focus::foreground_app();
+                let rendered =
+                    if paragraphs { engine.render_paragraphs_by_id(id, &app) } else { engine.render_by_id(id, &app) };
+                match rendered {
                     Ok(x) => {
                         perform(&Expansion { erase, ..x });
                         engine.inserted();
@@ -718,7 +723,7 @@ impl Popup {
         let id = e.id;
         let engine = self.engine.clone();
         let then: AfterEdit = Box::new(move || {
-            let _ = engine.send(ToEngine::Insert { id, erase: 0 });
+            let _ = engine.send(ToEngine::Insert { id, erase: 0, paragraphs: false });
         });
         self.end_edit(true, Some(then), cx);
     }
@@ -962,6 +967,7 @@ impl Popup {
             }
             Ui::Hook(HookEvent::Accept { .. }) => self.accept(self.selected, cx),
             Ui::Hook(HookEvent::AcceptRow(row)) => self.accept(row, cx),
+            Ui::Hook(HookEvent::AcceptParagraphs) => self.accept_as(self.selected, true, cx),
             Ui::Hook(HookEvent::Edit) => self.open_from_popup(true),
             Ui::Hook(HookEvent::New { .. }) => self.open_from_popup(false),
             // From the popup: the popup itself shows the form.
@@ -1131,8 +1137,8 @@ impl Popup {
     /// boxes.
     fn toggle(&mut self, row: usize, cx: &mut Context<Self>) {
         let Some(&index) = self.results.get(row) else { return };
-        if let Some(checked) = self.pick.as_mut().and_then(|p| p.checked.as_mut()) {
-            checked[index] = !checked[index];
+        if let Some(Pick { items, checked: Some(checked), .. }) = self.pick.as_mut() {
+            popup_core::form::toggle(items, checked, index);
             cx.notify();
         }
     }
@@ -1148,6 +1154,12 @@ impl Popup {
     }
 
     fn accept(&mut self, row: usize, cx: &mut Context<Self>) {
+        self.accept_as(row, false, cx);
+    }
+
+    /// Inserts a row. With `paragraphs` (Ctrl+P), the snippet opens a list
+    /// that asks which of its paragraphs to insert.
+    fn accept_as(&mut self, row: usize, paragraphs: bool, cx: &mut Context<Self>) {
         if let Some(pick) = &self.pick {
             // With check boxes, the checked items go back. With none
             // checked, the selected row does.
@@ -1175,7 +1187,7 @@ impl Popup {
             return;
         };
         popup_core::log::line(&format!(
-            "ui accept: row {row} of {}, insertable {}",
+            "ui accept: row {row} of {}, insertable {}, paragraphs {paragraphs}",
             self.results.len(),
             e.insertable
         ));
@@ -1186,7 +1198,7 @@ impl Popup {
         }
         let erase = self.trigger.chars().count() + self.keyword.chars().count();
         self.hide();
-        let _ = self.engine.send(ToEngine::Insert { id: e.id, erase });
+        let _ = self.engine.send(ToEngine::Insert { id: e.id, erase, paragraphs });
     }
 }
 
@@ -1438,6 +1450,7 @@ fn kind(ev: &HookEvent) -> &'static str {
         HookEvent::EditClick => "edit click",
         HookEvent::Accept { .. } => "accept",
         HookEvent::AcceptRow(_) => "accept row",
+        HookEvent::AcceptParagraphs => "accept as paragraphs",
         HookEvent::Edit => "edit",
         HookEvent::New { .. } => "new",
         HookEvent::Toggle(_) => "toggle",

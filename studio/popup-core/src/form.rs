@@ -210,16 +210,32 @@ pub struct PickItem {
     pub detail: String,
     /// A short tag at the right, for example the file. Can be empty.
     pub badge: String,
+    /// The row that this row belongs to, for example the lead of a list
+    /// item in a paragraph pick. Checking or unchecking the parent does the
+    /// same to the row.
+    pub parent: Option<usize>,
 }
 
 impl PickItem {
     pub fn new(title: impl Into<String>) -> Self {
-        PickItem { title: title.into(), detail: String::new(), badge: String::new() }
+        PickItem { title: title.into(), detail: String::new(), badge: String::new(), parent: None }
     }
 
     /// The text that the filter searches.
     pub fn search_text(&self) -> String {
         format!("{} {} {}", self.title, self.detail, self.badge)
+    }
+}
+
+/// Checks or unchecks row `index` of a check-box list. The rows whose
+/// parent it is get the same state.
+pub fn toggle(items: &[PickItem], checked: &mut [bool], index: usize) {
+    let Some(state) = checked.get(index).map(|c| !c) else { return };
+    checked[index] = state;
+    for (i, item) in items.iter().enumerate() {
+        if item.parent == Some(index) {
+            checked[i] = state;
+        }
     }
 }
 
@@ -244,6 +260,20 @@ mod tests {
 
     fn obj(pairs: &[(&str, Value)]) -> Value {
         Value::Object(pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect())
+    }
+
+    #[test]
+    fn a_parent_passes_its_state_to_its_rows() {
+        let row = |parent| PickItem { parent, ..PickItem::new("") };
+        let items = [row(None), row(None), row(Some(1)), row(Some(1))];
+        let mut checked = [true, true, true, false];
+        toggle(&items, &mut checked, 1);
+        assert_eq!(checked, [true, false, false, false]);
+        toggle(&items, &mut checked, 1);
+        assert_eq!(checked, [true, true, true, true]);
+        toggle(&items, &mut checked, 2);
+        assert_eq!(checked, [true, true, false, true]);
+        toggle(&items, &mut checked, 9);
     }
 
     #[test]

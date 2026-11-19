@@ -83,6 +83,10 @@ pub enum HookEvent {
     /// Enter or Tab with at least one result. The hook stays active until the
     /// UI calls [`Shared::deactivate`].
     Accept { keyword: String },
+    /// Ctrl+P with at least one result: insert the selected snippet as a
+    /// paragraph pick, so a list asks which paragraphs to keep. The hook
+    /// stays active until the UI calls [`Shared::deactivate`].
+    AcceptParagraphs,
     /// Ctrl+1 to Ctrl+9: insert the row with that number (0-based here).
     /// The hook stays active until the UI calls [`Shared::deactivate`].
     AcceptRow(usize),
@@ -498,6 +502,11 @@ impl Machine {
             Key::CtrlLetter('e') | Key::Right if self.shared.results.load(Ordering::Relaxed) > 0 => {
                 crate::log::line("hook edit");
                 self.emit(HookEvent::Edit);
+                Verdict::Swallow
+            }
+            Key::CtrlLetter('p') if self.shared.results.load(Ordering::Relaxed) > 0 => {
+                crate::log::line("hook accept as paragraph pick");
+                self.emit(HookEvent::AcceptParagraphs);
                 Verdict::Swallow
             }
             Key::CtrlLetter('n') => {
@@ -1105,6 +1114,19 @@ mod tests {
         assert_eq!(events(&rx).last(), Some(&HookEvent::New { keyword: "si".into() }));
         assert_eq!(m.key(Key::CtrlLetter('c')), Verdict::Pass);
         assert_eq!(events(&rx).last(), Some(&HookEvent::Cancel));
+    }
+
+    #[test]
+    fn ctrl_p_accepts_as_a_paragraph_pick() {
+        let (mut m, rx, shared) = machine();
+        typed(&mut m, "//si");
+        // Ctrl+P needs a result.
+        assert_eq!(m.key(Key::CtrlLetter('p')), Verdict::Pass);
+        assert_eq!(events(&rx).last(), Some(&HookEvent::Cancel));
+        typed(&mut m, "//si");
+        shared.set_results(1);
+        assert_eq!(m.key(Key::CtrlLetter('p')), Verdict::Swallow);
+        assert_eq!(events(&rx).last(), Some(&HookEvent::AcceptParagraphs));
     }
 
     #[test]

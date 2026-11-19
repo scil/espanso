@@ -12,9 +12,12 @@
 //!     Best regards
 //! ```
 //!
-//! A blank line separates paragraphs. The checked paragraphs keep their
-//! order in the text and are joined with one blank line. `checked: none`
-//! starts with no paragraph checked; the default is `all`. espanso ignores
+//! A blank line separates paragraphs. A paragraph with a list splits once
+//! more: its lines before the list are one row, and each list item is a
+//! row. The checked rows keep their order in the text. Rows of one
+//! paragraph are joined with a line break, paragraphs with one blank line.
+//! `checked: none` starts with no row checked; the default is `all`.
+//! espanso ignores
 //! the `snip:` key and inserts the whole text.
 
 use serde_norway::Value;
@@ -52,12 +55,17 @@ fn show(v: &Value) -> String {
     serde_norway::to_string(v).unwrap_or_default().trim().to_string()
 }
 
-/// A text split into paragraphs.
+/// A text split into rows: paragraphs, and the lead and list items of a
+/// paragraph with a list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pieces {
     /// Blank lines before the first paragraph.
     pub head: String,
     pub parts: Vec<String>,
+    /// The paragraph of each part, counted from 0.
+    pub groups: Vec<usize>,
+    /// Whether each part is a list item.
+    pub items: Vec<bool>,
     /// White space after the last paragraph, for example the line break
     /// that a YAML `|` block adds.
     pub tail: String,
@@ -75,34 +83,82 @@ pub fn split(text: &str) -> Pieces {
         start += line.len();
     }
     let (head, core) = core.split_at(start);
-    let mut parts = Vec::new();
-    let mut current = String::new();
+    let mut paragraphs = Vec::new();
+    let mut current = Vec::new();
     for line in core.split('\n') {
         if line.trim().is_empty() {
             if !current.is_empty() {
-                parts.push(std::mem::take(&mut current));
+                paragraphs.push(std::mem::take(&mut current));
             }
         } else {
-            if !current.is_empty() {
-                current.push('\n');
-            }
-            current.push_str(line);
+            current.push(line);
         }
     }
     if !current.is_empty() {
-        parts.push(current);
+        paragraphs.push(current);
     }
-    Pieces { head: head.to_string(), parts, tail: tail.to_string() }
+    let mut pieces =
+        Pieces { head: head.to_string(), parts: vec![], groups: vec![], items: vec![], tail: tail.to_string() };
+    for (group, lines) in paragraphs.iter().enumerate() {
+        for (text, item) in split_list(lines) {
+            pieces.parts.push(text);
+            pieces.groups.push(group);
+            pieces.items.push(item);
+        }
+    }
+    pieces
 }
 
-/// The text with only the paragraphs in `chosen`, in text order, joined
-/// with one blank line. Indexes out of range are skipped.
+/// The indent of a line that starts a list item: `- `, `* `, `+ `, `1. `
+/// or `1) ` after spaces. `None` for other lines.
+fn item_indent(line: &str) -> Option<usize> {
+    let rest = line.trim_start();
+    let indent = line.len() - rest.len();
+    let digits = rest.chars().take_while(char::is_ascii_digit).count();
+    let starts = if digits > 0 {
+        rest[digits..].starts_with(". ") || rest[digits..].starts_with(") ")
+    } else {
+        ["- ", "* ", "+ "].iter().any(|m| rest.starts_with(m))
+    };
+    starts.then_some(indent)
+}
+
+/// Splits the lines of a paragraph into its lead and its list items. Each
+/// item at the smallest indent starts a row; other lines stay in the row
+/// above them. A paragraph with no list, or with one item and no lead, is
+/// one row. The flag tells whether a row is a list item.
+fn split_list(lines: &[&str]) -> Vec<(String, bool)> {
+    let whole = || vec![(lines.join("\n"), false)];
+    let Some(top) = lines.iter().filter_map(|l| item_indent(l)).min() else { return whole() };
+    let mut rows: Vec<(Vec<&str>, bool)> = Vec::new();
+    for &line in lines {
+        let starts = item_indent(line) == Some(top);
+        match rows.last_mut() {
+            Some(row) if !starts => row.0.push(line),
+            _ => rows.push((vec![line], starts)),
+        }
+    }
+    if rows.len() < 2 {
+        return whole();
+    }
+    rows.into_iter().map(|(l, item)| (l.join("\n"), item)).collect()
+}
+
+/// The text with only the parts in `chosen`, in text order. Parts of one
+/// paragraph are joined with a line break, paragraphs with one blank line.
+/// Indexes out of range are skipped.
 pub fn join(pieces: &Pieces, chosen: &[usize]) -> String {
     let mut chosen: Vec<usize> = chosen.iter().copied().filter(|&i| i < pieces.parts.len()).collect();
     chosen.sort_unstable();
     chosen.dedup();
-    let body: Vec<&str> = chosen.iter().map(|&i| pieces.parts[i].as_str()).collect();
-    format!("{}{}{}", pieces.head, body.join("\n\n"), pieces.tail)
+    let mut body = String::new();
+    for (n, &i) in chosen.iter().enumerate() {
+        if n > 0 {
+            body.push_str(if pieces.groups[chosen[n - 1]] == pieces.groups[i] { "\n" } else { "\n\n" });
+        }
+        body.push_str(&pieces.parts[i]);
+    }
+    format!("{}{}{}", pieces.head, body, pieces.tail)
 }
 
 /// The variable names that a text uses, as espanso reads them:
@@ -165,6 +221,23 @@ mod tests {
     fn finds_variable_names() {
         assert_eq!(var_names("a {{x}} b {{ form1.name }} {{x}} {{bad name}} {{{y}}"), ["x", "form1", "x", "y"]);
         assert_eq!(var_names("{{a.b.c}} {{ok}} {{open"), ["ok"]);
+    }
+
+    #[test]
+    fn splits_a_list_into_items() {
+        let p = split("Intro\n\nAdd:\n  - one\n    more\n  - two\n    - deep\n  - three\n\nBye");
+        assert_eq!(p.parts, ["Intro", "Add:", "  - one\n    more", "  - two\n    - deep", "  - three", "Bye"]);
+        assert_eq!(p.groups, [0, 1, 1, 1, 1, 2]);
+        assert_eq!(p.items, [false, false, true, true, true, false]);
+        assert_eq!(join(&p, &[1, 3, 5]), "Add:\n  - two\n    - deep\n\nBye");
+        assert_eq!(join(&p, &[2, 4]), "  - one\n    more\n  - three");
+    }
+
+    #[test]
+    fn keeps_a_single_item_whole() {
+        assert_eq!(split("- only\n  more").parts, ["- only\n  more"]);
+        assert_eq!(split("1. a\n2) b\n-x").parts, ["1. a", "2) b\n-x"]);
+        assert_eq!(split("-x\n*y").parts, ["-x\n*y"]);
     }
 
     #[test]
