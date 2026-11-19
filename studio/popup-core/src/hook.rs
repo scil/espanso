@@ -2,7 +2,7 @@
 //! hooks.
 //!
 //! The user types in the target application as usual. When the last typed
-//! characters equal the trigger (for example `;;`), the hook becomes active
+//! characters equal the trigger (for example `,,`), the hook becomes active
 //! and reports [`HookEvent::Open`]. While it is active:
 //!
 //! - Printable characters go to the application and extend the keyword
@@ -110,7 +110,7 @@ pub enum HookEvent {
 #[derive(Default)]
 pub struct Shared {
     active: AtomicBool,
-    /// The session is a pick list from the expander, not a `;;` search.
+    /// The session is a pick list from the expander, not a `,,` search.
     pick: AtomicBool,
     /// The pick list has check boxes.
     many: AtomicBool,
@@ -118,6 +118,10 @@ pub struct Shared {
     /// key between them starts with an empty filter.
     picks: AtomicUsize,
     paused: AtomicBool,
+    /// The expander holds a trigger that is the start of a longer one. The
+    /// hook then swallows a confirm key and passes it on as
+    /// [`Input::Confirm`].
+    waiting: AtomicBool,
     results: AtomicUsize,
     popup: Mutex<Option<Rect>>,
 }
@@ -130,6 +134,13 @@ impl Shared {
     }
     pub fn is_paused(&self) -> bool {
         self.paused.load(Ordering::Relaxed)
+    }
+    /// The expander sets this after each key: whether a trigger waits.
+    pub fn set_waiting(&self, waiting: bool) {
+        self.waiting.store(waiting, Ordering::Relaxed);
+    }
+    pub fn is_waiting(&self) -> bool {
+        self.waiting.load(Ordering::Relaxed)
     }
     /// Number of results the popup shows now.
     pub fn set_results(&self, n: usize) {
@@ -151,7 +162,7 @@ impl Shared {
         self.active.store(false, Ordering::Relaxed);
         self.set_popup_rect(None);
     }
-    /// Starts a pick-list session. It replaces an open `;;` session.
+    /// Starts a pick-list session. It replaces an open `,,` session.
     pub fn start_pick(&self) {
         self.set_results(0);
         self.many.store(false, Ordering::Relaxed);
@@ -323,7 +334,7 @@ impl Machine {
         let _ = self.tx.send((Instant::now(), ev));
     }
 
-    /// Keeps the keyword of a `;;` session that ends, for `.`.
+    /// Keeps the keyword of a `,,` session that ends, for `.`.
     fn remember(&mut self) {
         if !self.in_pick && !self.keyword.is_empty() {
             self.last = self.keyword.clone();
@@ -345,7 +356,31 @@ impl Machine {
         self.active && self.shared.active.load(Ordering::Relaxed)
     }
 
+    /// The confirm key for a waiting trigger, as the engine sees it. Space
+    /// always confirms. Enter and Tab confirm only without the popup: in the
+    /// popup they insert the selected row, and the exact trigger is first.
+    fn confirm_char(&self, key: Key) -> Option<char> {
+        if !self.shared.is_waiting() || self.shared.is_picking() {
+            return None;
+        }
+        match key {
+            Key::Char(' ') => Some(' '),
+            Key::Enter if !self.is_active() => Some('\n'),
+            Key::Tab if !self.is_active() => Some('\t'),
+            _ => None,
+        }
+    }
+
     pub fn key(&mut self, key: Key) -> Verdict {
+        if let Some(c) = self.confirm_char(key) {
+            crate::log::line("hook confirm the waiting trigger");
+            // Only one confirm per wait. The engine sets the flag again if
+            // the next trigger waits too.
+            self.shared.set_waiting(false);
+            self.recent.clear();
+            self.pass_on(Input::Confirm(c));
+            return Verdict::Swallow;
+        }
         let verdict = self.popup_key(key);
         let input = match (verdict, key) {
             (Verdict::Swallow, _) => Some(Input::Reset),
@@ -1232,6 +1267,43 @@ mod tests {
                 Input::Char('\n'),
             ]
         );
+    }
+
+    #[test]
+    fn confirm_key_is_swallowed_while_a_trigger_waits() {
+        let shared = Arc::new(Shared::default());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let on_input: OnInput = Box::new(move |i| sink.lock().unwrap().push(i));
+        let mut m = Machine::new("//".chars().collect(), shared.clone(), tx, Some(on_input));
+        typed(&mut m, "gm");
+        shared.set_waiting(true);
+        assert_eq!(m.key(Key::Enter), Verdict::Swallow);
+        // One confirm per wait: the next Enter goes to the application.
+        assert_eq!(m.key(Key::Enter), Verdict::Pass);
+        shared.set_waiting(true);
+        assert_eq!(m.key(Key::Char(' ')), Verdict::Swallow);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                Input::Char('g'),
+                Input::Char('m'),
+                Input::Confirm('\n'),
+                Input::Char('\n'),
+                Input::Confirm(' '),
+            ]
+        );
+    }
+
+    #[test]
+    fn enter_in_the_popup_accepts_while_a_trigger_waits() {
+        let (mut m, rx, shared) = machine();
+        typed(&mut m, "//gm");
+        shared.set_results(1);
+        shared.set_waiting(true);
+        assert_eq!(m.key(Key::Enter), Verdict::Swallow);
+        assert!(matches!(events(&rx).last(), Some(HookEvent::Accept { .. })));
     }
 
     #[test]

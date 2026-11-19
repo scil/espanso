@@ -23,7 +23,7 @@ There are two modes. In the one-shot mode (`popup-slint`, `popup-gpui`), a new p
    4. The bottom-left corner of the focused UI Automation element.
    5. The mouse pointer.
 4. The popup opens 6 px below the caret. If it does not fit below, it opens above. It always stays inside the work area of the caret's monitor.
-5. You type to search. Up and Down select a snippet. Enter inserts it. If you type a full espanso trigger, such as `;;doc`, espanso expands it at once and the popup closes. The popup sees espanso's injected key presses and knows that the keyword at the caret is gone.
+5. You type to search. Up and Down select a snippet. Enter inserts it. If you type a full espanso trigger, such as `,,doc`, espanso expands it at once and the popup closes. The popup sees espanso's injected key presses and knows that the keyword at the caret is gone.
 
 Escape closes the popup.
 6. The popup gives focus back to the previous window, then sends the text.
@@ -67,7 +67,7 @@ target/release/popup-slint.exe --timing --keep-open --type
 
 `cargo run -p popup-core --example caret_probe -- 3` waits 3 seconds, then prints the caret position of the focused window and the method that found it.
 
-`cargo run -p popup-core --example filter_probe -- doc ";;"` prints the first three matches for `doc` after the trigger `;;`, in popup order, with their text.
+`cargo run -p popup-core --example filter_probe -- doc ",,"` prints the first three matches for `doc` after the trigger `,,`, in popup order, with their text.
 
 `cargo run -p popup-core --example paste_probe -- 3 1 hello` waits 3 seconds, sends 1 Backspace to the focused window, then types `hello`. Two more arguments set the chunk size and the pause in ms. If the fourth argument is `paste`, it pastes instead. A text of the form `@20` stands for 20 numbered test lines.
 
@@ -100,18 +100,18 @@ In Notepad on Windows 11, UI Automation found the exact caret in 16 to 18 ms.
 
 `snip` works like an input method candidate window. You type in the target application as usual:
 
-1. You type the trigger, `;;` by default. The popup opens below the caret. It lists the snippets whose triggers start with `;;` first.
-2. You type the keyword. The characters go into the target application, and the popup filters its list after each one. Many triggers start with the popup trigger, so the popup compares the keyword with each snippet trigger without that prefix. For the keyword `doc`, `;;doc` comes first.
+1. You type the trigger, `,,` by default. The popup opens below the caret. It lists the snippets whose triggers start with `,,` first.
+2. You type the keyword. The characters go into the target application, and the popup filters its list after each one. Many triggers start with the popup trigger, so the popup compares the keyword with each snippet trigger without that prefix. For the keyword `doc`, `,,doc` comes first.
 3. Up and Down select a snippet. Enter or Tab inserts it. Ctrl+1 to Ctrl+9 inserts the row with that number. Caps Lock or Ctrl+P inserts the selected snippet as a paragraph pick. A list with check boxes asks which paragraphs to insert. This works for every snippet, with or without a `snip: { pick: many }` key (see [Paragraph picks](EXPANDER.md#paragraph-picks)). After each typed key, the first row is selected, so Enter or Tab inserts the first row. The `--tab` option changes what Tab does.
 
-`;;.` repeats the last search. If `.` is the first keyword character, snip replaces it with the keyword of the last `;;` search, inserted or not. snip types that keyword into the application, and you can go on typing. Before the first search, `.` is an ordinary keyword character.
+`,,.` repeats the last search. If `.` is the first keyword character, snip replaces it with the keyword of the last `,,` search, inserted or not. snip types that keyword into the application, and you can go on typing. Before the first search, `.` is an ordinary keyword character.
 
 Each row has one line: a number for the first nine rows, then the snippet `label`. A snippet without a label shows the start of its text. The rows do not show triggers, but the keyword still matches them.
 
-An exact match is a snippet with a trigger that is the typed text in full, ignoring case. For `;;anki`, the snippet with the trigger `;;anki` is an exact match, and `;;anki2` is not. Exact matches come first. Each one has a colored bar on its left edge, a bold title, and its trigger in a colored badge on the right.
+An exact match is a snippet with a trigger that is the typed text in full, ignoring case. For `,,anki`, the snippet with the trigger `,,anki` is an exact match, and `,,anki2` is not. Exact matches come first. Each one has a colored bar on its left edge, a bold title, and its trigger in a colored badge on the right.
 4. The popup erases the trigger and the keyword with Backspace key presses, then inserts the snippet text as [Inserting text](#inserting-text) describes.
 
-If you type a full espanso trigger, such as `;;doc`, espanso expands it at once and the popup closes. The popup sees espanso's injected key presses and knows that the keyword at the caret is gone.
+If you type a full espanso trigger, such as `,,doc`, espanso expands it at once and the popup closes. The popup sees espanso's injected key presses and knows that the keyword at the caret is gone.
 
 Ctrl+E or Right opens the selected snippet in an edit form. A right click on a row opens that snippet. The popup itself grows to the right and shows the form there, beside its list, and takes focus. A click on another row, or Alt+Up and Alt+Down, opens that row in the form. Tab moves between the boxes of the form. Ctrl+F gives the list the focus, and you type there to search. Up and Down then show each row in the form while the list keeps the focus, and Right puts the cursor in the form. Esc closes the form, and the popup shows only its list, with focus: Enter then inserts, and Esc again closes the popup. If no snippet matches, Right closes the popup and moves the caret. Ctrl+N opens the form with a new snippet, and the typed trigger and keyword become its first trigger. Both erase the typed text first (see [EDITOR.md](EDITOR.md)).
 
@@ -124,7 +124,7 @@ target/release/snip.exe --timing
 
 | Flag | Effect |
 | --- | --- |
-| `--trigger TEXT` | Characters that open the popup. The default is `;;`. No snippet in the test configuration has `;;` alone as its trigger. |
+| `--trigger TEXT` | Characters that open the popup. The default is `,,`. No snippet in the test configuration has `,,` alone as its trigger. |
 | `--timing` | Print timing marks to standard error. |
 | `--base DIR` | espanso folder, as in the one-shot mode. |
 | `--log FILE` | Write events to FILE. It records no typed text. |
@@ -185,7 +185,7 @@ Both modes use the same rules. A UTF-16 unit is one character, or half of an emo
 | `--long-text type` | Type long text as key events. The clipboard stays untouched. |
 | `--type-chunk N` | Typing sends N characters per `SendInput` call. The default is 1. |
 | `--type-gap-ms N` | Typing waits N ms between calls. The default is 5. |
-| `--prefix-wait-ms N` | A typed trigger that is also the start of a longer trigger waits N ms for the next key. The default is 500. While the popup is open, the wait has no time limit. See `EXPANDER.md`. |
+| `--prefix-wait-ms N` | A typed trigger that is also the start of a longer trigger waits for the next key. Space, Tab or Enter expands it, and that key is not typed. With N above 0, the short trigger also expands after N ms without a key. The default is 0: no time limit. While the popup is open, the wait never has a time limit. See `EXPANDER.md`. |
 | `--tab accept\|move\|ignore` | What Tab does while the popup is open. `accept` (default) inserts the selected row, as Enter does, and Shift+Tab does the same. `move` selects the next row, and Shift+Tab selects the previous row. `ignore` leaves Tab to the application, and the popup closes. A pick list follows the same setting. |
 
 A paste does not leave the snippet in the clipboard history:

@@ -1,7 +1,8 @@
-//! The snippet editor window. See `studio/EDITOR.md`, step 3.
+//! The snippet editor form. See `studio/EDITOR.md`, step 3.
 //!
-//! Left: a search box and the snippet list. Right: one match, as a form or
-//! as YAML text. The YAML text is the source of truth. The form reads it with
+//! It lives in the popup window, to the right of the popup list, which picks
+//! the snippet (the edit session). It shows one match as a form and as YAML
+//! text. The YAML text is the source of truth. The form reads it with
 //! `snip_core::matchedit` when the Form tab opens, and writes it back as the
 //! smallest change when the YAML tab opens or on Save.
 //!
@@ -10,7 +11,7 @@
 //! save, `reload` makes the engine load the configuration again.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -20,24 +21,21 @@ use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputSt
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::radio::RadioGroup;
 use gpui_kit::component::tab::{Tab, TabBar};
-use gpui_kit::component::{ActiveTheme, IconName, Sizable};
+use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
-use popup_core::focus::{self, Handle};
-use popup_core::{place, Rect};
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use popup_core::focus;
 use serde_norway::Value;
 use snip_core::matchedit::{self, MatchForm, Param, OUTPUT_KEYS, VAR_TYPES};
 use snip_core::workspace::Snippet;
 use snip_core::yamlfile::MatchFile;
 use snip_core::{SnipError, Workspace};
 
-const LIST_W: f32 = 320.0;
-/// The window size in logical pixels, with the list. "Hide list" makes the
-/// window narrower by `LIST_W`.
-const FULL_W: f32 = 1080.0;
-const WINDOW_H: f32 = 780.0;
-const MAX_ROWS: usize = 300;
+/// The height of the tab row above the form. The popup's list header in the
+/// edit session has the same height, so the two halves line up.
+pub const TAB_ROW_H: f32 = 34.0;
+/// The width of the form beside the popup list, in logical pixels.
+pub const FORM_W: f32 = 700.0;
 const DEFAULT_FILE: &str = "match/base.yml";
 /// The label that marks the copy of the snippet that the Test button renders.
 const TEST_LABEL: &str = "__snip_editor_test__";
@@ -45,18 +43,14 @@ const TEST_LABEL: &str = "__snip_editor_test__";
 /// What the editor shows when it opens.
 #[derive(Debug, Clone)]
 pub enum Request {
-    /// The list, with the first snippet selected.
-    Browse,
-    /// The snippet with these triggers (joined with spaces, or the regex)
-    /// and label, as the popup shows it. `keyword` is the popup's search
-    /// text and `prefix` its trigger, such as `;;`. The list shows the same
-    /// search, in the popup's order.
-    Find { trigger: String, label: String, keyword: String, prefix: String },
+    /// The snippet with these triggers (joined with two spaces, or the
+    /// regex) and label, as the popup shows it.
+    Find { trigger: String, label: String },
     /// A new snippet. `trigger` fills the first trigger.
     New { trigger: Option<String> },
 }
 
-/// What an embedded editor tells the view that holds it.
+/// What the editor tells the popup that holds it.
 pub enum EditorEvent {
     /// Esc: the holder removes the form and keeps its list.
     Close,
@@ -108,68 +102,6 @@ pub fn init(cx: &mut App) {
         }
     })
     .detach();
-}
-
-/// A step that would drop unsaved edits. It waits until the user saves or
-/// discards them.
-enum Pending {
-    /// Open this snippet (file, index) from the list.
-    Open(String, usize),
-    /// Show a request from the popup, the tray or the New button.
-    Request(Request),
-}
-
-/// Opens the editor window, or brings the open one to the front and shows
-/// the request there.
-///
-/// `near` is the screen rectangle of the popup, when the request comes from
-/// the popup. The editor then opens with its list where the popup was, on
-/// the same monitor, and the form to the right of the list. So the popup's
-/// list seems to grow a form. The window stays hidden until it is in place,
-/// so it never shows up somewhere else first.
-pub fn open(
-    handle: &mut Option<WindowHandle<EditorView>>,
-    base: PathBuf,
-    reload: Rc<dyn Fn()>,
-    request: Request,
-    near: Option<Rect>,
-    cx: &mut App,
-) {
-    let place = near.map(place_near);
-    if let Some(h) = handle {
-        let req = request.clone();
-        let shown = h.update(cx, |view, window, cx| {
-            view.quick = near.is_some();
-            if view.compact {
-                view.toggle_list(window, cx);
-            }
-            view.request(req, window, cx);
-            view.front(place);
-        });
-        if shown.is_ok() {
-            return;
-        }
-    }
-    let quick = near.is_some();
-    // The window opens hidden and shows up only in its place: where the
-    // popup was, where it was last time, or in the middle of the monitor
-    // with the mouse.
-    let place = place.or_else(|| Some(full_place()));
-    let options = WindowOptions {
-        window_bounds: Some(WindowBounds::centered(size(px(FULL_W), px(WINDOW_H)), cx)),
-        titlebar: Some(TitlebarOptions { title: Some("snip editor".into()), ..Default::default() }),
-        focus: false,
-        show: false,
-        kind: WindowKind::Normal,
-        ..Default::default()
-    };
-    let opened = cx.open_window(options, move |window, cx| {
-        cx.new(|cx| EditorView::new(base, reload, request, quick, place, false, window, cx))
-    });
-    match opened {
-        Ok(h) => *handle = Some(h),
-        Err(e) => popup_core::log::line(&format!("editor: cannot open the window: {e:#}")),
-    }
 }
 
 /// The match on the right side.
@@ -226,29 +158,15 @@ struct FormInputs {
 pub struct EditorView {
     ws: Option<Workspace>,
     reload: Rc<dyn Fn()>,
-    hwnd: Option<Handle>,
-    /// Without the list, for a quick edit from the popup.
-    compact: bool,
-    /// The editor lives in the popup window. See [`EditorView::embedded`].
-    embedded: bool,
-    /// The window came from the popup. It does not store its rectangle.
-    quick: bool,
-    /// The popup trigger of the last request from the popup, such as `;;`.
-    /// The list ranks its search the way the popup does.
-    prefix: String,
-    search: Entity<InputState>,
+    /// Every snippet in the match files, to find a requested snippet and to
+    /// warn about a trigger that another snippet uses.
     all: Vec<Snippet>,
-    shown: Vec<usize>,
-    selected: Option<usize>,
     files: Vec<String>,
     /// Every match file, packages included. The Test button imports them.
     match_files: Vec<String>,
     /// The names of the global variables in all match files.
     global_names: HashSet<String>,
-    /// The list shows only this file.
-    file_filter: Option<String>,
     target_file: String,
-    file_menu: bool,
     current: Option<Current>,
     yaml: Entity<EditorState>,
     /// 0 is "Snippet", 1 is "More options".
@@ -269,16 +187,18 @@ pub struct EditorView {
     /// Esc was pressed once with unsaved edits.
     confirm_close: bool,
     /// The step that waits for Save or Discard of unsaved edits.
-    pending: Option<Pending>,
+    /// A request that would drop unsaved edits. It waits until the user
+    /// saves or discards them.
+    pending: Option<Request>,
     /// The result of the Test button.
     test_output: Option<Result<String, String>>,
     testing: bool,
-    /// The window title now, to set it only when it changes.
-    title: String,
-    list_scroll: ScrollHandle,
+    /// The width of the space left of the New button, measured at each paint.
+    /// The file button and its menu take this width.
+    file_w: Rc<std::cell::Cell<f32>>,
     form_scroll: ScrollHandle,
     /// The heights the user gave the text areas by dragging their handles,
-    /// by area key. They last while the window is open.
+    /// by area key. They last while the form is open.
     area_heights: HashMap<SharedString, Pixels>,
     /// The focus of the window itself, for keys when no box has the focus.
     focus: FocusHandle,
@@ -289,48 +209,16 @@ pub struct EditorView {
 }
 
 impl EditorView {
-    /// An editor inside another view's window, without its list: the popup
-    /// shows its own list beside it. It never moves, titles or closes the
-    /// window. To close, it emits [`EditorEvent::Close`].
-    pub fn embedded(
-        base: PathBuf,
-        reload: Rc<dyn Fn()>,
-        request: Request,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        Self::new(base, reload, request, true, None, true, window, cx)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        base: PathBuf,
-        reload: Rc<dyn Fn()>,
-        request: Request,
-        quick: bool,
-        place: Option<Rect>,
-        embedded: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search triggers, labels, text, files"));
+    /// An editor inside the popup window. The popup shows its own list
+    /// beside it. It never moves or closes the window. To close, it emits
+    /// [`EditorEvent::Close`].
+    pub fn new(base: PathBuf, reload: Rc<dyn Fn()>, request: Request, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let yaml = cx.new(|cx| EditorState::new(window, cx).language("yaml"));
-        let subs = vec![
-            cx.subscribe_in(&search, window, |this, _, ev: &InputEvent, _, cx| {
-                if matches!(ev, InputEvent::Change) {
-                    this.filter(cx);
-                }
-            }),
-            cx.subscribe_in(&yaml, window, |this, _, ev: &InputEvent, window, cx| {
-                if matches!(ev, InputEvent::Change) && this.yaml_text(cx) != this.last_yaml {
-                    this.read_form(window, cx);
-                }
-            }),
-        ];
-        let hwnd = match HasWindowHandle::window_handle(window).map(|h| h.as_raw()) {
-            Ok(RawWindowHandle::Win32(h)) if !embedded => Some(Handle(h.hwnd.get())),
-            _ => None,
-        };
+        let subs = vec![cx.subscribe_in(&yaml, window, |this, _, ev: &InputEvent, window, cx| {
+            if matches!(ev, InputEvent::Change) && this.yaml_text(cx) != this.last_yaml {
+                this.read_form(window, cx);
+            }
+        })];
         let (ws, status, status_error) = match Workspace::open(Some(base)) {
             Ok(ws) => (Some(ws), String::new(), false),
             Err(e) => (None, format!("Cannot open the espanso folder: {e}"), true),
@@ -338,21 +226,11 @@ impl EditorView {
         let mut view = EditorView {
             ws,
             reload,
-            hwnd,
-            compact: embedded,
-            quick,
-            embedded,
-            prefix: String::new(),
-            search,
             all: Vec::new(),
-            shown: Vec::new(),
-            selected: None,
             files: Vec::new(),
             match_files: Vec::new(),
             global_names: HashSet::new(),
-            file_filter: None,
             target_file: last_file().unwrap_or_else(|| DEFAULT_FILE.into()),
-            file_menu: false,
             current: None,
             yaml,
             tab: 0,
@@ -368,23 +246,17 @@ impl EditorView {
             pending: None,
             test_output: None,
             testing: false,
-            title: String::new(),
-            list_scroll: ScrollHandle::new(),
+            file_w: Rc::new(std::cell::Cell::new(0.0)),
             form_scroll: ScrollHandle::new(),
             area_heights: HashMap::new(),
             focus: cx.focus_handle(),
             keep_focus: false,
             _subs: subs,
         };
-        // The close button of the title bar asks first, like Esc.
         let weak = cx.entity().downgrade();
-        EDITORS.with(|e| e.borrow_mut().push(weak.clone()));
-        if !embedded {
-            window.on_window_should_close(cx, move |_, cx| weak.update(cx, |view, cx| view.may_close(cx)).unwrap_or(true));
-        }
+        EDITORS.with(|e| e.borrow_mut().push(weak));
         view.refresh_list(cx);
         view.load(request, window, cx);
-        view.front(place);
         view
     }
 
@@ -395,7 +267,7 @@ impl EditorView {
 
     /// Shows a request, but asks first if that drops unsaved edits.
     pub fn request(&mut self, request: Request, window: &mut Window, cx: &mut Context<Self>) {
-        self.go(Pending::Request(request), window, cx);
+        self.go(request, window, cx);
     }
 
     /// Like [`EditorView::request`], but the focus stays where it is: Up and
@@ -404,13 +276,13 @@ impl EditorView {
     /// answer then loads as usual.
     pub fn preview(&mut self, request: Request, window: &mut Window, cx: &mut Context<Self>) {
         self.keep_focus = true;
-        self.go(Pending::Request(request), window, cx);
+        self.go(request, window, cx);
         self.keep_focus = false;
     }
 
     /// Runs `step` now, or keeps it for the Save / Discard bar when there
     /// are unsaved edits.
-    fn go(&mut self, step: Pending, window: &mut Window, cx: &mut Context<Self>) {
+    fn go(&mut self, step: Request, window: &mut Window, cx: &mut Context<Self>) {
         if self.dirty(cx) {
             self.pending = Some(step);
             cx.notify();
@@ -419,16 +291,13 @@ impl EditorView {
         self.run(step, window, cx);
     }
 
-    fn run(&mut self, step: Pending, window: &mut Window, cx: &mut Context<Self>) {
+    fn run(&mut self, step: Request, window: &mut Window, cx: &mut Context<Self>) {
         self.pending = None;
-        match step {
-            Pending::Open(file, index) => self.open_snippet(&file, index, window, cx),
-            Pending::Request(r) => self.load(r, window, cx),
-        }
+        self.load(step, window, cx);
     }
 
-    /// Before the window closes: the first try with unsaved edits only
-    /// warns. Returns whether the window may close.
+    /// Before the form closes: the first try with unsaved edits only warns.
+    /// Returns whether the form may close.
     fn may_close(&mut self, cx: &mut Context<Self>) -> bool {
         if self.dirty(cx) && !self.confirm_close {
             self.confirm_close = true;
@@ -436,48 +305,7 @@ impl EditorView {
             cx.notify();
             return false;
         }
-        self.remember_rect();
         true
-    }
-
-    /// Stores the window rectangle for the next start. A window from the
-    /// popup is a quick edit where the popup was, so it does not count.
-    fn remember_rect(&self) {
-        let (Some(h), false) = (self.hwnd, self.quick) else { return };
-        if let Some(r) = focus::window_rect(h) {
-            // A minimized window sits at -32000.
-            if r.left > -30000 && r.width() > 200 && r.height() > 200 {
-                write_setting(RECT_FILE, &format!("{} {} {} {}", r.left, r.top, r.right, r.bottom));
-            }
-        }
-    }
-
-    /// Moves the window to `place` (if any) and brings it to the front.
-    /// Windows lets a background process do this right after a tray click or
-    /// a popup key. gpui handles the messages of these calls with its app
-    /// state, which this thread holds now, so another thread makes them.
-    fn front(&self, place: Option<Rect>) {
-        if let Some(h) = self.hwnd {
-            std::thread::spawn(move || {
-                if let Some(r) = place {
-                    focus::move_window(h, r);
-                }
-                focus::bring_to_front(h);
-            });
-        }
-    }
-
-    /// Shows or hides the snippet list. The window grows or shrinks by the
-    /// width of the list.
-    fn toggle_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.embedded {
-            return;
-        }
-        self.compact = !self.compact;
-        let mut s = window.bounds().size;
-        s.width = if self.compact { s.width - px(LIST_W) } else { s.width + px(LIST_W) };
-        window.resize(s);
-        cx.notify();
     }
 
     fn refresh_list(&mut self, cx: &mut Context<Self>) {
@@ -506,37 +334,6 @@ impl EditorView {
                 .flat_map(|m| m.global_vars.into_iter().map(|(name, _)| name))
                 .collect();
         }
-        if self.file_filter.as_ref().is_some_and(|f| !self.all.iter().any(|s| &s.file == f)) {
-            self.file_filter = None;
-        }
-        self.filter(cx);
-    }
-
-    fn filter(&mut self, cx: &mut Context<Self>) {
-        let q = self.search.read(cx).value().to_lowercase();
-        self.shown = self
-            .all
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| self.file_filter.as_ref().is_none_or(|f| &s.file == f))
-            .filter(|(_, s)| q.is_empty() || matches_query(s, &q))
-            .map(|(i, _)| i)
-            .collect();
-        // The popup's order: exact triggers first, then triggers that start
-        // with the search. The sort is stable, so file order stays within a
-        // rank.
-        if !q.is_empty() {
-            let all = &self.all;
-            let prefix = self.prefix.as_str();
-            self.shown.sort_by_cached_key(|&i| {
-                let s = &all[i];
-                popup_core::data::trigger_rank(
-                    s.triggers.iter().map(String::as_str).chain(s.regex.as_deref()),
-                    &q,
-                    prefix,
-                )
-            });
-        }
         cx.notify();
     }
 
@@ -551,19 +348,7 @@ impl EditorView {
         self.pending = None;
         self.test_output = None;
         match request {
-            Request::Browse => {
-                if self.current.is_none() {
-                    if let Some(&i) = self.shown.first() {
-                        let (file, index) = (self.all[i].file.clone(), self.all[i].index);
-                        self.open_snippet(&file, index, window, cx);
-                    }
-                }
-            }
-            Request::Find { trigger, label, keyword, prefix } => {
-                // The list shows the popup's search, in the popup's order.
-                self.prefix = prefix;
-                self.file_filter = None;
-                self.search.update(cx, |s, cx| s.set_value(keyword.trim().to_string(), window, cx));
+            Request::Find { trigger, label } => {
                 // The list may be older than the engine's snippets.
                 self.refresh_list(cx);
                 // The popup joins several triggers with two spaces.
@@ -574,27 +359,14 @@ impl EditorView {
                     .find(|s| same(s) && s.label.as_deref().unwrap_or("") == label)
                     .or_else(|| self.all.iter().find(|s| same(s)))
                     .map(|s| (s.file.clone(), s.index));
-                // The editor's search looks at less text than the popup's.
-                // If it misses the snippet, the whole list shows.
-                if let Some((file, index)) = &found {
-                    let hit = self.shown.iter().any(|&i| &self.all[i].file == file && self.all[i].index == *index);
-                    if !hit {
-                        self.search.update(cx, |s, cx| s.set_value("", window, cx));
-                        self.filter(cx);
-                    }
-                }
                 match found {
                     Some((file, index)) => self.open_snippet(&file, index, window, cx),
                     None => {
-                        // Show the list, searched for the first trigger, so
-                        // the user can pick the snippet by hand.
-                        if self.compact {
-                            self.toggle_list(window, cx);
-                        }
-                        let first = trigger.split_whitespace().next().unwrap_or("").to_string();
-                        self.search.update(cx, |s, cx| s.set_value(first, window, cx));
-                        self.filter(cx);
-                        self.set_status(format!("No snippet in the files has the trigger {trigger}. Pick it in the list."), true);
+                        self.current = None;
+                        self.form = None;
+                        self.inputs = None;
+                        self.set_yaml("", window, cx);
+                        self.set_status(format!("No snippet in the files has the trigger {trigger}. Reload, then pick it again."), true);
                     }
                 }
             }
@@ -608,7 +380,6 @@ impl EditorView {
                     read_only: false,
                     line: 0,
                 });
-                self.selected = None;
                 self.set_yaml(&text, window, cx);
                 self.tab = 0;
                 self.form = None;
@@ -618,8 +389,7 @@ impl EditorView {
                 self.set_status("New snippet. Ctrl+S saves it.", false);
             }
         }
-        // The cursor goes to the replacement text, or to the search box when
-        // no snippet is open.
+        // The cursor goes to the replacement text.
         self.tab = 0;
         self.confirm_close = false;
         if self.keep_focus {
@@ -628,9 +398,8 @@ impl EditorView {
         }
         match &self.inputs {
             Some(inputs) => inputs.body.update(cx, |s, cx| s.focus(window, cx)),
-            None if !self.compact => self.search.update(cx, |s, cx| s.focus(window, cx)),
-            // The search box is hidden. The window itself takes the keys,
-            // so Esc still closes it.
+            // No form: the editor itself takes the keys, so Esc still closes
+            // it.
             None => window.focus(&self.focus, cx),
         }
         cx.notify();
@@ -640,10 +409,6 @@ impl EditorView {
         let Some(ws) = &self.ws else { return };
         match ws.get_snippet(file, index) {
             Ok(d) => {
-                self.selected = self.all.iter().position(|s| s.file == file && s.index == index);
-                if let Some(pos) = self.selected.and_then(|i| self.shown.iter().position(|&s| s == i)) {
-                    self.list_scroll.scroll_to_item(pos);
-                }
                 self.current = Some(Current {
                     file: d.snippet.file.clone(),
                     index: Some(index),
@@ -766,9 +531,9 @@ impl EditorView {
             e
         };
         let mut triggers: Vec<_> =
-            form.triggers.iter().map(|t| line(t, ";;sig", window, cx)).collect();
+            form.triggers.iter().map(|t| line(t, ",,sig", window, cx)).collect();
         if triggers.is_empty() {
-            triggers.push(line("", ";;sig", window, cx));
+            triggers.push(line("", ",,sig", window, cx));
         }
         let vars = form
             .vars
@@ -804,7 +569,7 @@ impl EditorView {
             comments: area(&form.comments.join("\n"), "# lines above the match", 2, window, cx),
             triggers,
             regex: line(&form.regex, "A regex trigger replaces the triggers", window, cx),
-            label: line(&form.label, "Name shown in the ;; popup (optional)", window, cx),
+            label: line(&form.label, "Name shown in the ,, popup (optional)", window, cx),
             search_terms: area(&form.search_terms.join("\n"), "search terms, one per line", 2, window, cx),
             body: area(&form.body, "Text to insert. {{name}} inserts a variable.", 8, window, cx),
             vars,
@@ -926,30 +691,6 @@ impl EditorView {
         cx.notify();
     }
 
-    /// Up or Down in the search box: opens the next or previous snippet of
-    /// the list.
-    fn list_step(&mut self, down: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.shown.is_empty() {
-            return;
-        }
-        let pos = self.selected.and_then(|i| self.shown.iter().position(|&s| s == i));
-        let next = match pos {
-            None => 0,
-            Some(p) if down => (p + 1).min(self.shown.len() - 1),
-            Some(p) => p.saturating_sub(1),
-        };
-        if Some(next) == pos {
-            return;
-        }
-        let s = &self.all[self.shown[next]];
-        let step = Pending::Open(s.file.clone(), s.index);
-        self.go(step, window, cx);
-    }
-
-    fn search_focused(&self, window: &Window, cx: &App) -> bool {
-        self.search.read(cx).focus_handle(cx).is_focused(window)
-    }
-
     /// Warnings for the triggers: a trigger that another snippet uses too.
     fn trigger_hints(&self, cx: &App) -> Vec<String> {
         let Some(inputs) = &self.inputs else { return Vec::new() };
@@ -1049,26 +790,11 @@ impl EditorView {
             }
             (true, "enter") => {
                 if !self.dirty(cx) || self.save(window, cx) {
-                    if self.embedded {
-                        cx.emit(EditorEvent::Done);
-                    } else {
-                        self.close(window, cx);
-                    }
+                    cx.emit(EditorEvent::Done);
                 }
             }
-            (true, "f") if self.embedded => cx.emit(EditorEvent::FocusList),
+            (true, "f") => cx.emit(EditorEvent::FocusList),
             (true, "n") => self.request(Request::New { trigger: None }, window, cx),
-            (false, k @ ("up" | "down")) if self.search_focused(window, cx) => self.list_step(k == "down", window, cx),
-            (false, "enter") if self.search_focused(window, cx) => match &self.inputs {
-                Some(inputs) => inputs.body.update(cx, |s, cx| s.focus(window, cx)),
-                None => self.list_step(true, window, cx),
-            },
-            (true, "f") if !self.embedded => {
-                if self.compact {
-                    self.toggle_list(window, cx);
-                }
-                self.search.update(cx, |s, cx| s.focus(window, cx));
-            }
             (_, "escape") => return,
             _ => {
                 self.confirm_close = false;
@@ -1078,16 +804,13 @@ impl EditorView {
         cx.stop_propagation();
     }
 
-    /// The text boxes in Tab order: the search box (if the list shows),
-    /// then the boxes of the open form tab, top to bottom. The YAML box is
+    /// The text boxes in Tab order: the boxes of the open form tab, top to
+    /// bottom. The YAML box is
     /// not in the order, so Tab indents there.
     fn tab_order(&self, cx: &App) -> Vec<FocusHandle> {
         let line = |s: &Entity<InputState>| s.read(cx).focus_handle(cx);
         let area = |s: &Entity<TextareaState>| s.read(cx).focus_handle(cx);
         let mut order = Vec::new();
-        if !self.compact {
-            order.push(line(&self.search));
-        }
         let (Some(form), Some(inputs)) = (&self.form, &self.inputs) else { return order };
         if self.tab == 0 {
             if form.regex.is_empty() {
@@ -1138,8 +861,7 @@ impl EditorView {
         true
     }
 
-    /// Esc from the holder of an embedded editor: closes like Esc in the
-    /// form. With unsaved edits, the first call only warns.
+    /// Esc from the popup list: closes like Esc in the form. With unsaved edits, the first call only warns.
     pub fn try_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.may_close(cx) {
             self.close(window, cx);
@@ -1148,8 +870,8 @@ impl EditorView {
         }
     }
 
-    /// Esc closes the window. With unsaved edits, the first Esc only warns.
-    /// It runs after the inputs, so a menu that Esc closes keeps the window.
+    /// Esc closes the form. With unsaved edits, the first Esc only warns.
+    /// It runs after the inputs, so a menu that Esc closes keeps the form.
     fn on_escape(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if ev.keystroke.key != "escape" || ev.keystroke.modifiers.modified() {
             return;
@@ -1160,116 +882,19 @@ impl EditorView {
         }
     }
 
-    /// Closes the window, or asks the holder of an embedded editor to
-    /// remove it.
-    fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.embedded {
-            cx.emit(EditorEvent::Close);
-        } else {
-            self.remember_rect();
-            window.remove_window();
-        }
+    /// Asks the popup to remove the form.
+    fn close(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(EditorEvent::Close);
     }
 
     // Rendering.
-
-    fn render_list(&self, theme: &component::Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let filter_button = self.file_filter_button(cx);
-        let rows = self.shown.iter().take(MAX_ROWS).enumerate().map(|(row, &i)| {
-            let s = &self.all[i];
-            let title = s.label.clone().or_else(|| s.triggers.first().cloned()).or_else(|| s.regex.clone()).unwrap_or_default();
-            let sub = if s.label.is_some() { s.triggers.join("  ") } else { s.preview.lines().next().unwrap_or("").to_string() };
-            let selected = self.selected == Some(i);
-            let (file, index) = (s.file.clone(), s.index);
-            div()
-                .id(("snip", row))
-                .px_2()
-                .py_1()
-                .rounded_md()
-                .when(selected, |d| d.bg(theme.list_active))
-                .when(!selected, |d| d.hover(|st| st.bg(theme.list_hover)))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, window, cx| this.go(Pending::Open(file.clone(), index), window, cx)),
-                )
-                .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).truncate().child(title))
-                .child(div().text_xs().text_color(theme.muted_foreground).truncate().child(sub))
-        });
-        let more = (self.shown.len() > MAX_ROWS).then(|| {
-            div().p_2().text_xs().text_color(theme.muted_foreground).child(format!(
-                "{} more. Type more letters to narrow the list.",
-                self.shown.len() - MAX_ROWS
-            ))
-        });
-        div()
-            .w(px(LIST_W))
-            .h_full()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .p_2()
-            .border_r_1()
-            .border_color(theme.border)
-            .child(Input::new(&self.search))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(format!("{} of {} snippets", self.shown.len(), self.all.len())),
-                    )
-                    .child(filter_button),
-            )
-            .child(
-                div()
-                    .id("list")
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.list_scroll)
-                    .children(rows)
-                    .children(more),
-            )
-    }
-
-    /// The menu that limits the list to one file. Each item shows the
-    /// number of snippets in the file.
-    fn file_filter_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
-        for s in &self.all {
-            *counts.entry(s.file.as_str()).or_default() += 1;
-        }
-        let items: Vec<(Option<String>, String)> = std::iter::once((None, format!("All files ({})", self.all.len())))
-            .chain(counts.iter().map(|(f, n)| (Some(f.to_string()), format!("{f} ({n})"))))
-            .collect();
-        let label = self.file_filter.clone().unwrap_or_else(|| "All files".into());
-        let current = self.file_filter.clone();
-        let weak = cx.entity().downgrade();
-        Button::new("file-filter").label(label).icon(IconName::ChevronDown).ghost().xsmall().dropdown_menu(move |mut menu, _, _| {
-            for (file, text) in &items {
-                let (view, file) = (weak.clone(), file.clone());
-                menu = menu.item(PopupMenuItem::new(text.clone()).checked(file == current).on_click(move |_, _, cx| {
-                    let _ = view.update(cx, |this, cx| {
-                        this.file_filter = file.clone();
-                        this.filter(cx);
-                    });
-                }));
-            }
-            menu
-        })
-    }
 
     /// The bar that waits for Save or Discard before a step drops unsaved
     /// edits.
     fn render_pending(&self, theme: &component::Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let what = match self.pending.as_ref()? {
-            Pending::Open(..) => "open the other snippet",
-            Pending::Request(Request::New { .. }) => "start a new snippet",
-            Pending::Request(_) => "open the snippet",
+            Request::New { .. } => "start a new snippet",
+            Request::Find { .. } => "open the snippet",
         };
         Some(
             div()
@@ -1426,7 +1051,7 @@ impl EditorView {
         }
         let text = match &self.form_error {
             Some(e) => format!("The form cannot show this match. {e}"),
-            None => "Pick a snippet on the left, or press Ctrl+N for a new one.".into(),
+            None => "Pick a snippet in the list, or press Ctrl+N for a new one.".into(),
         };
         let color = if self.form_error.is_some() { theme.danger } else { theme.muted_foreground };
         Some(div().p_4().text_color(color).child(text).into_any_element())
@@ -1652,40 +1277,51 @@ impl EditorView {
             Some(c) if c.index.is_some() => c.file.clone(),
             _ => format!("New snippet goes to: {}", self.target_file),
         };
-        let file_button = Button::new("file").label(file_label).ghost().compact().on_click(cx.listener(|this, _, _, cx| {
-            this.file_menu = !this.file_menu;
-            cx.notify();
-        }));
-        let menu = (self.file_menu && new_match).then(|| {
-            div()
-                .id("files")
-                .max_h(px(240.0))
-                .overflow_y_scroll()
-                .p_1()
-                .rounded_md()
-                .border_1()
-                .border_color(theme.border)
-                .bg(theme.background)
-                .children(self.files.iter().map(|f| {
-                    let file = f.clone();
-                    div()
-                        .id(SharedString::from(format!("f-{f}")))
-                        .px_2()
-                        .py_0p5()
-                        .rounded_sm()
-                        .text_sm()
-                        .hover(|s| s.bg(theme.list_hover))
-                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                            this.target_file = file.clone();
-                            if let Some(c) = &mut this.current {
-                                c.file = file.clone();
-                            }
-                            this.file_menu = false;
-                            cx.notify();
-                        }))
-                        .child(f.clone())
-                }))
-        });
+        // A new snippet picks its file in a drop-down menu. The menu closes
+        // itself on a click outside it and on Esc. It opens upward, because
+        // the button sits at the bottom of the form.
+        // The button and the menu reach the New button. The width comes from
+        // the last paint. Until the first paint the button keeps its own width.
+        let width = self.file_w.get();
+        // The button centers its label and icon. A child that fills the
+        // button keeps them on the left instead.
+        let content = div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap_1()
+            .when(new_match, |d| d.child(Icon::new(IconName::ChevronUp).small()))
+            .child(div().min_w_0().whitespace_nowrap().text_ellipsis().child(file_label));
+        let file_button = Button::new("file").child(content).ghost().compact();
+        let file_button = if width > 0.0 { file_button.w(px(width)) } else { file_button };
+        let file_button = if new_match {
+            let files = self.files.clone();
+            let current = self.target_file.clone();
+            let weak = cx.entity().downgrade();
+            let menu_w = self.file_w.clone();
+            file_button
+                .dropdown_menu_with_anchor(Anchor::BottomLeft, move |mut menu, _, _| {
+                    let w = px(menu_w.get().max(200.0));
+                    menu = menu.scrollable(true).max_h(px(320.0)).min_w(w).max_w(w);
+                    for f in &files {
+                        let (view, file) = (weak.clone(), f.clone());
+                        menu = menu.item(PopupMenuItem::new(f.clone()).checked(*f == current).on_click(move |_, _, cx| {
+                            let _ = view.update(cx, |this, cx| {
+                                this.target_file = file.clone();
+                                if let Some(c) = &mut this.current {
+                                    c.file = file.clone();
+                                }
+                                cx.notify();
+                            });
+                        }));
+                    }
+                    menu
+                })
+                .into_any_element()
+        } else {
+            file_button.into_any_element()
+        };
         let has = self.current.is_some();
         let saved = self.current.as_ref().is_some_and(|c| c.index.is_some());
         let save_label = if self.dirty(cx) { "\u{2022} Save  Ctrl+S" } else { "Save  Ctrl+S" };
@@ -1697,13 +1333,37 @@ impl EditorView {
             .p_2()
             .border_t_1()
             .border_color(theme.border)
-            .children(menu)
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(div().flex_1().min_w_0().flex().overflow_hidden().child(file_button))
+                    .child({
+                        let cell = self.file_w.clone();
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .overflow_hidden()
+                            .child(file_button)
+                            // Measures the space. A change paints once more.
+                            .child(
+                                canvas(
+                                    move |bounds, window, _| {
+                                        let w = f32::from(bounds.size.width).floor();
+                                        if (cell.get() - w).abs() >= 1.0 {
+                                            cell.set(w);
+                                            window.refresh();
+                                        }
+                                    },
+                                    |_, _, _, _| {},
+                                )
+                                .absolute()
+                                .inset_0()
+                                .size_full(),
+                            )
+                    })
                     .when(saved, |d| {
                         d.child(Button::new("open-file").label("Open file").ghost().compact().tooltip("Open the file at this snippet").on_click(
                             cx.listener(|this, _, _, cx| this.open_in_file(cx)),
@@ -1744,28 +1404,8 @@ impl EditorView {
 }
 
 impl Render for EditorView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        // The title names the snippet, with a dot while it has unsaved edits.
-        let name = self
-            .inputs
-            .as_ref()
-            .and_then(|i| i.triggers.first())
-            .map(|t| t.read(cx).value().to_string())
-            .filter(|t| !t.is_empty())
-            .or_else(|| self.form.as_ref().map(|f| f.regex.clone()).filter(|r| !r.is_empty()));
-        let title = match (&self.current, name) {
-            (None, _) => "snip editor".to_string(),
-            (Some(_), name) => format!(
-                "{}{} - snip editor",
-                if self.dirty(cx) { "\u{2022} " } else { "" },
-                name.unwrap_or_else(|| "new snippet".into())
-            ),
-        };
-        if title != self.title && !self.embedded {
-            window.set_window_title(&title);
-            self.title = title;
-        }
         let more_label = if self.form.as_ref().is_some_and(needs_more) { "More options \u{2022}" } else { "More options" };
         let tabs = TabBar::new("tabs")
             .underline()
@@ -1798,20 +1438,14 @@ impl Render for EditorView {
             .flex_col()
             .child(
                 div()
+                    .h(px(TAB_ROW_H))
+                    .flex_none()
                     .flex()
-                    .items_center()
+                    .items_end()
                     .px_2()
-                    .pt_1()
-                    .child(div().flex_1().child(tabs))
-                    .when(!self.embedded, |d| {
-                        d.child(
-                            Button::new("list")
-                                .label(if self.compact { "Show list" } else { "Hide list" })
-                                .ghost()
-                                .xsmall()
-                                .on_click(cx.listener(|this, _, window, cx| this.toggle_list(window, cx))),
-                        )
-                    }),
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(div().flex_1().child(tabs)),
             )
             .children(self.render_pending(&theme, cx))
             .child(
@@ -1837,7 +1471,6 @@ impl Render for EditorView {
             .key_context(KEY_CONTEXT)
             .capture_key_down(cx.listener(Self::on_key))
             .on_key_down(cx.listener(Self::on_escape))
-            .when(!self.compact, |d| d.child(self.render_list(&theme, cx)))
             .child(right)
     }
 }
@@ -1886,16 +1519,6 @@ fn quote(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-fn matches_query(s: &Snippet, q: &str) -> bool {
-    let hit = |t: &str| t.to_lowercase().contains(q);
-    s.triggers.iter().any(|t| hit(t))
-        || s.regex.as_deref().is_some_and(hit)
-        || s.label.as_deref().is_some_and(hit)
-        || hit(&s.preview)
-        || s.search_terms.iter().any(|t| hit(t))
-        || hit(&s.file)
-}
-
 fn save_error(e: &SnipError) -> String {
     match e {
         SnipError::Conflict { .. } => "The file changed on disk since you opened this snippet. Pick it in the list again to load the new text.".into(),
@@ -1907,46 +1530,8 @@ fn save_error(e: &SnipError) -> String {
     }
 }
 
-/// The window rectangle for a popup at `near`: the list starts at the
-/// popup's top left corner, and the form is to its right. The rectangle
-/// moves inside the work area of that monitor.
-fn place_near(near: Rect) -> Rect {
-    let (work, scale) = place::monitor_at(near.left, near.top);
-    let w = ((FULL_W * scale).round() as i32).min(work.width());
-    let h = ((WINDOW_H * scale).round() as i32).min(work.height());
-    let left = near.left.min(work.right - w).max(work.left);
-    let top = near.top.min(work.bottom - h).max(work.top);
-    Rect { left, top, right: left + w, bottom: top + h }
-}
-
-/// The window rectangle for a start from the tray: where it was last time,
-/// if that is still on a monitor, or else in the middle of the monitor with
-/// the mouse.
-fn full_place() -> Rect {
-    let saved = read_setting(RECT_FILE).and_then(|t| {
-        let n: Vec<i32> = t.split_whitespace().filter_map(|x| x.parse().ok()).collect();
-        (n.len() == 4).then(|| Rect { left: n[0], top: n[1], right: n[2], bottom: n[3] })
-    });
-    if let Some(r) = saved {
-        let (work, _) = place::monitor_at((r.left + r.right) / 2, r.top + 10);
-        // The title bar must be on the monitor, so the user can move it.
-        let reachable = r.top >= work.top - 10 && r.top + 30 <= work.bottom && r.right > work.left + 50 && r.left < work.right - 50;
-        if reachable {
-            return r;
-        }
-    }
-    let (x, y) = focus::cursor_pos();
-    let (work, scale) = place::monitor_at(x, y);
-    let w = ((FULL_W * scale).round() as i32).min(work.width());
-    let h = ((WINDOW_H * scale).round() as i32).min(work.height());
-    let left = work.left + (work.width() - w) / 2;
-    let top = work.top + (work.height() - h) / 2;
-    Rect { left, top, right: left + w, bottom: top + h }
-}
-
 /// The settings of the editor are small text files in `%LOCALAPPDATA%\snip`.
 const LAST_FILE: &str = "last-file.txt";
-const RECT_FILE: &str = "editor-window.txt";
 
 fn read_setting(name: &str) -> Option<String> {
     let dir = std::env::var_os("LOCALAPPDATA")?;

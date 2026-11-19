@@ -121,31 +121,80 @@ impl Entry {
 /// Indexes of the entries that match `query`, best first.
 ///
 /// Each word of the query must appear somewhere in the entry. `prefix` is
-/// the popup trigger, such as `;;`. Many triggers start with it, and the
+/// the popup trigger, such as `,,`. Many triggers start with it, and the
 /// user types the keyword after it, so the ranking compares the query with
 /// each trigger without that prefix:
 ///
-/// 0. A trigger is the typed text in full: `prefix` and the query (`;;doc`
+/// 0. A trigger is the typed text in full: `prefix` and the query (`,,doc`
 ///    for `doc`). See [`exact_trigger`].
 /// 1. A trigger starts with `prefix` and the rest starts with the query
-///    (`;;docx` for `doc`).
+///    (`,,docx` for `doc`).
 /// 2. A trigger starts with the query.
 /// 3. A trigger contains the query.
 /// 4. Any other hit.
 ///
 /// An empty query lists the triggers that start with `prefix` first.
 pub fn filter(entries: &[Entry], query: &str, prefix: &str) -> Vec<usize> {
+    filter_in(entries, query, prefix, None)
+}
+
+/// [`filter`], limited to the entries of one match file when `file` is
+/// set. The limit applies before [`MAX_RESULTS`], so a file with many
+/// snippets still fills the list.
+pub fn filter_in(entries: &[Entry], query: &str, prefix: &str, file: Option<&str>) -> Vec<usize> {
     let q = query.trim().to_lowercase();
     let prefix = prefix.to_lowercase();
     let words: Vec<&str> = q.split_whitespace().collect();
     let mut hits: Vec<(u8, usize)> = entries
         .iter()
         .enumerate()
+        .filter(|(_, e)| file.is_none_or(|f| e.file == f))
         .filter(|(_, e)| words.iter().all(|w| e.haystack.contains(w)))
         .map(|(i, e)| (rank_lower(e.trigger_lower.split("  "), &q, &prefix), i))
         .collect();
     hits.sort();
     hits.into_iter().take(MAX_RESULTS).map(|(_, i)| i).collect()
+}
+
+/// Sets the `file` and `index` of entries that came from the engine, which
+/// does not know the file of a match. `snippets` holds the file snippets
+/// as `snip-core` lists them. An entry takes the first unused snippet with
+/// the same triggers (or regex) and label, the rule the editor also uses to
+/// find a snippet. An entry with no such snippet keeps an empty file.
+pub fn assign_files(entries: &mut [Entry], snippets: &[snip_core::workspace::Snippet]) {
+    assign(
+        entries,
+        snippets.iter().map(|s| {
+            let trigger = if s.triggers.is_empty() { s.regex.clone().unwrap_or_default() } else { s.triggers.join("  ") };
+            (trigger, s.label.clone().unwrap_or_default(), s.file.clone(), s.index)
+        }),
+    );
+}
+
+/// [`assign_files`] for snippets given as (trigger, label, file, index).
+fn assign(entries: &mut [Entry], snippets: impl Iterator<Item = (String, String, String, usize)>) {
+    use std::collections::{HashMap, VecDeque};
+    let mut by_key: HashMap<(String, String), VecDeque<(String, usize)>> = HashMap::new();
+    for (trigger, label, file, index) in snippets {
+        by_key.entry((trigger, label)).or_default().push_back((file, index));
+    }
+    for e in entries {
+        let key = (e.trigger.clone(), e.label.clone());
+        if let Some((file, index)) = by_key.get_mut(&key).and_then(VecDeque::pop_front) {
+            e.file = file;
+            e.index = index;
+        }
+    }
+}
+
+/// The match files of `entries` with the number of entries in each, sorted
+/// by file. Entries with no known file are left out.
+pub fn file_counts(entries: &[Entry]) -> Vec<(String, usize)> {
+    let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
+    for e in entries.iter().filter(|e| !e.file.is_empty()) {
+        *counts.entry(e.file.as_str()).or_default() += 1;
+    }
+    counts.into_iter().map(|(f, n)| (f.to_string(), n)).collect()
 }
 
 /// The rank of a snippet with these triggers for `query`, as [`filter`]
@@ -214,25 +263,42 @@ mod tests {
         let e = vec![
             entry("doc", "a"),
             entry(":x", "doc text"),
-            entry(";;harvest  ;;doc", "b"),
-            entry("x;;doc", "c"),
+            entry(",,harvest  ,,doc", "b"),
+            entry("x,,doc", "c"),
         ];
-        assert_eq!(filter(&e, "doc", ";;"), vec![2, 0, 3, 1]);
+        assert_eq!(filter(&e, "doc", ",,"), vec![2, 0, 3, 1]);
     }
 
     #[test]
     fn empty_query_lists_prefix_triggers_first() {
-        let e = vec![entry(":a", "a"), entry(";;b", "b"), entry("c", "c"), entry(";;d", "d")];
-        assert_eq!(filter(&e, "", ";;"), vec![1, 3, 0, 2]);
+        let e = vec![entry(":a", "a"), entry(",,b", "b"), entry("c", "c"), entry(",,d", "d")];
+        assert_eq!(filter(&e, "", ",,"), vec![1, 3, 0, 2]);
     }
 
     #[test]
     fn exact_trigger_comes_first() {
-        // `;;anki2` loads first, but `;;anki` is the typed text in full.
-        let e = vec![entry(";;anki2", "a"), entry(";;x  ;;Anki", "b")];
-        assert_eq!(filter(&e, "anki", ";;"), vec![1, 0]);
-        assert_eq!(exact_trigger(&e[1], "anki", ";;"), Some(";;Anki"));
-        assert_eq!(exact_trigger(&e[0], "anki", ";;"), None);
-        assert_eq!(exact_trigger(&e[0], "", ";;"), None);
+        // `,,anki2` loads first, but `,,anki` is the typed text in full.
+        let e = vec![entry(",,anki2", "a"), entry(",,x  ,,Anki", "b")];
+        assert_eq!(filter(&e, "anki", ",,"), vec![1, 0]);
+        assert_eq!(exact_trigger(&e[1], "anki", ",,"), Some(",,Anki"));
+        assert_eq!(exact_trigger(&e[0], "anki", ",,"), None);
+        assert_eq!(exact_trigger(&e[0], "", ",,"), None);
+    }
+
+    #[test]
+    fn assigns_files_by_trigger_and_label() {
+        let mut entries = vec![entry(",,a", "x"), entry(",,a", "y"), entry(",,b", "z"), entry(",,c", "w")];
+        let snippets = [
+            (",,a", "a.yml", 0),
+            (",,a", "b.yml", 3),
+            (",,b", "b.yml", 1),
+        ]
+        .into_iter()
+        .map(|(t, f, i)| (t.to_string(), String::new(), f.to_string(), i));
+        assign(&mut entries, snippets);
+        let got: Vec<(&str, usize)> = entries.iter().map(|e| (e.file.as_str(), e.index)).collect();
+        assert_eq!(got, [("a.yml", 0), ("b.yml", 3), ("b.yml", 1), ("", 0)]);
+        assert_eq!(file_counts(&entries), [("a.yml".to_string(), 1), ("b.yml".to_string(), 2)]);
+        assert_eq!(filter_in(&entries, "", ",,", Some("b.yml")).len(), 2);
     }
 }

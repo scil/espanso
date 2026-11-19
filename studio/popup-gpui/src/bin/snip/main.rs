@@ -23,7 +23,6 @@ mod editor;
 mod form_view;
 mod tray;
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 
 use std::path::PathBuf;
@@ -33,7 +32,8 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::scroll::ScrollbarMode;
-use gpui_kit::component::{ActiveTheme, Theme};
+use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::{self as component, ActiveTheme, IconName, Sizable, Theme};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use popup_core::args::Args;
@@ -51,9 +51,14 @@ const ROW_H: f32 = 28.0;
 const MAX_ROWS: usize = 8;
 const PAD: f32 = 6.0;
 const STATUS_H: f32 = 22.0;
+/// The header above the list in the edit session. The form's tab row has
+/// the same height, so the two halves line up.
+const HEAD_H: f32 = editor::TAB_ROW_H;
+/// The form fades and slides in over this time when it opens.
+const FORM_IN: Duration = Duration::from_millis(120);
 /// The width of the edit form beside the list, and the window height while
 /// the popup shows it, in logical pixels.
-const FORM_W: f32 = 700.0;
+const FORM_W: f32 = editor::FORM_W;
 const EDIT_H: f32 = 760.0;
 
 /// The snippets for the popup, or the load error. The engine thread sets it
@@ -80,7 +85,7 @@ enum ToEngine {
     /// Load the configuration again.
     Reload,
     /// Ctrl+E or Ctrl+N in the popup: erase the popup trigger and the
-    /// keyword (`erase` characters), then open the editor. The erase comes
+    /// keyword (`erase` characters), then show the edit form. The erase comes
     /// first, while the target application still has the focus.
     Editor { erase: usize, request: editor::Request },
 }
@@ -91,7 +96,13 @@ fn load_engine(base: &std::path::Path, ui: &Sender<Ui>, shared: &Arc<Shared>) ->
     let ask = UiAsk { ui: ui.clone(), shared: shared.clone() };
     match Engine::load_with(base, Box::new(ask)) {
         Ok(engine) => {
-            let entries = engine.entries();
+            let mut entries = engine.entries();
+            // The engine does not know the file of a match. The file filter
+            // of the edit session needs it, so take it from the match files.
+            match snip_core::Workspace::open(Some(base.to_path_buf())).and_then(|ws| ws.list_snippets(None, None)) {
+                Ok(list) => data::assign_files(&mut entries, &list.snippets),
+                Err(e) => popup_core::log::line(&format!("engine: cannot read the files of the matches: {e}")),
+            }
             let n = entries.len();
             popup_core::log::line(&format!("engine: {n} matches loaded"));
             set_entries(Ok(Arc::new(entries)));
@@ -168,14 +179,17 @@ fn run_engine(
         std::thread::sleep(Duration::from_millis(10));
         perform(&x);
     };
-    // The `;;` popup was open during the current wait.
+    // The `,,` popup was open during the current wait.
     let mut popup_in_wait = false;
     loop {
-        // A trigger that starts a longer trigger waits for the next key. If
-        // none comes in time, it expands. While the popup is open, the user
-        // picks there, so the wait does not end by time: the next key
-        // decides. If the popup closes without a key, nothing expands.
-        let msg = if engine.waiting() {
+        // A trigger that starts a longer trigger waits for the next key. A
+        // confirm key (Space, Tab, Enter) expands it, and the hook swallows
+        // that key. With `--prefix-wait-ms N` above 0, the trigger also
+        // expands when no key comes in N ms. While the popup is open, the
+        // user picks there, so the wait does not end by time. If the popup
+        // closes without a key, nothing expands.
+        shared.set_waiting(engine.waiting());
+        let msg = if engine.waiting() && !prefix_wait.is_zero() {
             match rx.recv_timeout(prefix_wait) {
                 Ok(msg) => msg,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -289,7 +303,7 @@ impl UiAsk {
     /// `checked` gives the list check boxes and their start state.
     fn show_pick(&self, items: Vec<PickItem>, checked: Option<Vec<bool>>) -> Option<Vec<usize>> {
         // From here on the hook swallows typed keys, so the trigger stays
-        // as typed. It replaces an open `;;` session.
+        // as typed. It replaces an open `,,` session.
         if checked.is_some() {
             self.shared.start_pick_many();
         } else {
@@ -344,7 +358,8 @@ enum Ui {
     Base(PathBuf),
     /// A load ended: the number of snippets, or the error.
     Loaded(Result<usize, String>),
-    /// Open the editor. The engine sends it after it erased the typed text.
+    /// Show the edit form in the popup. The engine sends it after it erased
+    /// the typed text.
     Editor(editor::Request),
 }
 
@@ -366,7 +381,7 @@ fn controller(rx: Receiver<(Instant, HookEvent)>, tx: Sender<Ui>) {
                 timing::since(&format!("caret-{:?}", caret.source), pressed);
                 Ui::Open { caret, pressed }
             }
-            // `;;.`: the hook swallowed the `.`. Type the last keyword into
+            // `,,.`: the hook swallowed the `.`. Type the last keyword into
             // the application, so the erase after a pick removes it too.
             // The hook ignores this input, because it is our own.
             HookEvent::Repeat(keyword) => {
@@ -455,10 +470,7 @@ struct Popup {
     loaded: String,
     base: Option<PathBuf>,
     log: Option<PathBuf>,
-    /// The editor window, if it is open. Opened in `cx.defer`, so it lives
-    /// in a cell.
-    editor: Rc<RefCell<Option<WindowHandle<editor::EditorView>>>>,
-    /// Where the popup was when Ctrl+E or Ctrl+N opened the editor.
+    /// Where the popup was when Ctrl+E or Ctrl+N asked for the form.
     editor_near: Option<Rect>,
     /// The open pick list, if the session is one. `results` then points
     /// into its items.
@@ -484,6 +496,24 @@ struct EditSession {
     /// The popup window had focus once. A later loss of focus ends the edit,
     /// unless it has unsaved changes.
     was_active: bool,
+    /// The list shows only the snippets of this match file. It ends with
+    /// the session, so the next `,,` popup searches all files.
+    file: Option<String>,
+    /// The list shows the match files instead of snippets (Ctrl+O, or a
+    /// click on the file button).
+    files: Option<FilePick>,
+    /// Counts the times the form opened. Each opening gets a new animation.
+    form_gen: usize,
+    /// The tray started the session. No window waits for text, so a pick
+    /// in the list-only mode opens the form instead of inserting.
+    from_tray: bool,
+}
+
+/// The list of match files in the edit session.
+#[derive(Default)]
+struct FilePick {
+    query: String,
+    selected: usize,
 }
 
 /// A pick list from the expander: the items and where the answer goes.
@@ -553,7 +583,6 @@ impl Popup {
             loaded: "loading snippets".into(),
             base: None,
             log: args.log.clone(),
-            editor: Rc::new(RefCell::new(None)),
             editor_near: None,
             pick: None,
             edit: None,
@@ -567,7 +596,16 @@ impl Popup {
     fn edit_in_popup(&mut self, request: editor::Request, near: Rect, window: &mut Window, cx: &mut Context<Self>) {
         if self.edit.is_none() {
             let prev = focus::foreground().filter(|h| !focus::is_own(*h));
-            self.edit = Some(EditSession { form: None, near, prev, was_active: false });
+            self.edit = Some(EditSession {
+                form: None,
+                near,
+                prev,
+                was_active: false,
+                file: None,
+                files: None,
+                form_gen: 0,
+                from_tray: false,
+            });
             self.shared.set_popup_rect(None);
             popup_core::log::line("ui edit session: start");
         }
@@ -597,7 +635,7 @@ impl Popup {
         let reload: Rc<dyn Fn()> = Rc::new(move || {
             let _ = engine.send(ToEngine::Reload);
         });
-        let view = cx.new(|cx| editor::EditorView::embedded(base, reload, request, window, cx));
+        let view = cx.new(|cx| editor::EditorView::new(base, reload, request, window, cx));
         let sub = cx.subscribe_in(&view, window, |this, _, ev: &editor::EditorEvent, window, cx| match ev {
             editor::EditorEvent::Close => this.hide_form(window, cx),
             editor::EditorEvent::Done => this.end_edit(true, None, cx),
@@ -605,6 +643,7 @@ impl Popup {
         });
         if let Some(edit) = &mut self.edit {
             edit.form = Some((view, sub));
+            edit.form_gen += 1;
         }
         self.place_edit();
         cx.notify();
@@ -669,12 +708,7 @@ impl Popup {
     /// The request that opens the snippet of `row` in the form.
     fn find_request(&self, row: usize) -> Option<editor::Request> {
         let e = &self.snap.as_ref()?[*self.results.get(row)?];
-        Some(editor::Request::Find {
-            trigger: e.trigger.clone(),
-            label: e.label.clone(),
-            keyword: self.keyword.clone(),
-            prefix: self.trigger.clone(),
-        })
+        Some(editor::Request::Find { trigger: e.trigger.clone(), label: e.label.clone() })
     }
 
     /// Selects `row` in the edit session. An open form shows its snippet,
@@ -712,7 +746,11 @@ impl Popup {
     /// Inserts the snippet of `row` from the list-only mode: the window that
     /// had focus gets it back, and then the engine types the text. The typed
     /// trigger is already gone, so it erases nothing.
-    fn insert_from_list(&mut self, row: usize, cx: &mut Context<Self>) {
+    fn insert_from_list(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.edit.as_ref().is_some_and(|e| e.from_tray) {
+            self.edit_row(row, window, cx);
+            return;
+        }
         let Some(snips) = self.snap.clone() else { return };
         let Some(e) = self.results.get(row).map(|&i| &snips[i]) else { return };
         if !e.insertable {
@@ -748,7 +786,13 @@ impl Popup {
             return;
         }
         let form = self.form_view();
+        let key_char = k.key_char.clone();
+        if self.files_key(m.control, k.key.as_str(), key_char.as_deref(), window, cx) {
+            cx.stop_propagation();
+            return;
+        }
         match (m.control, k.key.as_str()) {
+            (true, "o") => self.open_files(window, cx),
             (false, "up") => self.select_row(self.selected.saturating_sub(1), window, cx),
             (false, "down") => self.select_row(self.selected + 1, window, cx),
             // The form asks about unsaved changes first, as for Esc there.
@@ -757,10 +801,10 @@ impl Popup {
                 None => self.end_edit(true, None, cx),
             },
             (false, "enter") if form.is_some() => self.enter_form(window, cx),
-            (false, "enter") => self.insert_from_list(self.selected, cx),
+            (false, "enter") => self.insert_from_list(self.selected, window, cx),
             (true, d) if form.is_none() && d.len() == 1 && ("1"..="9").contains(&d) => {
                 let row = d.parse::<usize>().unwrap_or(1) - 1;
-                self.insert_from_list(row, cx);
+                self.insert_from_list(row, window, cx);
             }
             // Up and Down already show the row in the form.
             (false, "right") | (true, "e") => self.enter_form(window, cx),
@@ -782,20 +826,6 @@ impl Popup {
             _ => return,
         }
         cx.stop_propagation();
-    }
-
-    /// Opens the editor window after this update.
-    /// Opens the editor after this update. `near` is the popup rectangle
-    /// for a request from the popup.
-    fn open_editor(&mut self, request: editor::Request, near: Option<Rect>, cx: &mut Context<Self>) -> Result<(), String> {
-        let base = self.base.clone().ok_or("the configuration folder is not known yet")?;
-        let engine = self.engine.clone();
-        let reload: Rc<dyn Fn()> = Rc::new(move || {
-            let _ = engine.send(ToEngine::Reload);
-        });
-        let handle = self.editor.clone();
-        cx.defer(move |cx| editor::open(&mut handle.borrow_mut(), base, reload, request, near, cx));
-        Ok(())
     }
 
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -823,15 +853,70 @@ impl Popup {
         }
         let actions = self.tray.as_ref().map(|t| t.poll()).unwrap_or_default();
         for action in actions {
-            self.tray_action(action, cx);
+            self.tray_action(action, window, cx);
         }
     }
 
-    fn tray_action(&mut self, action: tray::Action, cx: &mut Context<Self>) {
+    /// New snippet or Edit snippets in the tray: the popup opens its edit
+    /// session in the middle of the monitor with the mouse. `None` shows the
+    /// first snippet of the list, with the focus in the list for a search.
+    fn edit_from_tray(&mut self, request: Option<editor::Request>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.edit.is_none() {
+            // A `,,` popup or a pick list that is open now ends.
+            if self.open {
+                self.shared.deactivate();
+                self.hide();
+            }
+            let (x, y) = focus::cursor_pos();
+            let (work, scale) = place::monitor_at(x, y);
+            let w = ((WIDTH + FORM_W) * scale).round() as i32;
+            let h = (EDIT_H * scale).round() as i32;
+            let left = work.left + (work.width() - w).max(0) / 2;
+            let top = work.top + (work.height() - h).max(0) / 2;
+            let near = Rect { left, top, right: left + 1, bottom: top + 1 };
+            self.keyword.clear();
+            self.note = None;
+            self.snap = None;
+            self.selected = 0;
+            self.refresh(cx);
+            self.edit = Some(EditSession {
+                form: None,
+                near,
+                prev: None,
+                was_active: false,
+                file: None,
+                files: None,
+                form_gen: 0,
+                from_tray: true,
+            });
+            self.shared.set_popup_rect(None);
+            popup_core::log::line("ui edit session: start from the tray");
+        }
+        // The window comes to the front again, also when the session was
+        // already open behind another window.
+        self.shown = None;
+        let browse = request.is_none();
+        match request.or_else(|| self.find_request(self.selected)) {
+            Some(r) => self.show_form(r, window, cx),
+            None => self.place_edit(),
+        }
+        if browse {
+            self.focus_list(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn tray_action(&mut self, action: tray::Action, window: &mut Window, cx: &mut Context<Self>) {
         popup_core::log::line(&format!("tray: {action:?}"));
         let result = match action {
-            tray::Action::NewSnippet => self.open_editor(editor::Request::New { trigger: None }, None, cx),
-            tray::Action::EditSnippets => self.open_editor(editor::Request::Browse, None, cx),
+            tray::Action::NewSnippet => {
+                self.edit_from_tray(Some(editor::Request::New { trigger: None }), window, cx);
+                Ok(())
+            }
+            tray::Action::EditSnippets => {
+                self.edit_from_tray(None, window, cx);
+                Ok(())
+            }
             tray::Action::Pause(on) => {
                 self.shared.set_paused(on);
                 if on && self.open {
@@ -888,7 +973,7 @@ impl Popup {
             Ui::Open { .. } if !self.shared.is_active() => {
                 popup_core::log::line("ui ignored open: the session already ended");
             }
-            // A pick list replaced the `;;` session before its caret lookup
+            // A pick list replaced the `,,` session before its caret lookup
             // ended.
             Ui::Open { .. } if self.shared.is_picking() => {
                 popup_core::log::line("ui ignored open: a pick list is open");
@@ -973,11 +1058,7 @@ impl Popup {
             // From the popup: the popup itself shows the form.
             Ui::Editor(request) => match self.editor_near.take() {
                 Some(near) => self.edit_in_popup(request, near, window, cx),
-                None => {
-                    if let Err(e) = self.open_editor(request, None, cx) {
-                        popup_core::log::line(&format!("editor: {e}"));
-                    }
-                }
+                None => popup_core::log::line("ui ignored editor request: the popup is not on screen"),
             },
             Ui::Hook(HookEvent::Toggle(row)) => self.toggle(row.unwrap_or(self.selected), cx),
             Ui::Hook(HookEvent::ToggleAll) => self.toggle_all(cx),
@@ -1029,7 +1110,8 @@ impl Popup {
         match self.snap.clone().map(Ok).or_else(entries) {
             Some(Ok(entries)) => {
                 self.filled = true;
-                self.results = data::filter(&entries, &self.keyword, &self.trigger);
+                let file = self.edit.as_ref().and_then(|e| e.file.as_deref());
+                self.results = data::filter_in(&entries, &self.keyword, &self.trigger, file);
                 self.snap = Some(entries);
             }
             Some(Err(e)) => {
@@ -1042,9 +1124,124 @@ impl Popup {
     }
 
     fn height(&self) -> f32 {
-        let rows = self.results.len().clamp(1, MAX_ROWS);
-        let status = if self.status().is_some() { STATUS_H } else { 0.0 };
-        PAD * 2.0 + rows as f32 * ROW_H + status
+        // The edit session always shows its header and status line: the
+        // status line holds the Esc hint.
+        let (rows, head, status) = match &self.edit {
+            Some(_) => (self.list_rows().clamp(1, MAX_ROWS), HEAD_H, STATUS_H),
+            None => (self.results.len().clamp(1, MAX_ROWS), 0.0, if self.status().is_some() { STATUS_H } else { 0.0 }),
+        };
+        PAD * 2.0 + head + rows as f32 * ROW_H + status
+    }
+
+    /// The number of rows the list shows: files or snippets.
+    fn list_rows(&self) -> usize {
+        match self.file_rows() {
+            Some(rows) => rows.len(),
+            None => self.results.len(),
+        }
+    }
+
+    /// The rows of the file list while it shows: the file (`None` for all
+    /// files) and its text. The query keeps the files whose name has it.
+    fn file_rows(&self) -> Option<Vec<(Option<String>, String)>> {
+        let pick = self.edit.as_ref()?.files.as_ref()?;
+        let entries = self.snap.clone().or_else(|| entries().and_then(Result::ok)).unwrap_or_default();
+        let q = pick.query.to_lowercase();
+        let all = std::iter::once((None, format!("All files ({})", entries.len())));
+        let files = data::file_counts(&entries).into_iter().map(|(f, n)| {
+            let text = format!("{f} ({n})");
+            (Some(f), text)
+        });
+        Some(all.chain(files).filter(|(f, text)| (f.is_none() && q.is_empty()) || (f.is_some() && text.to_lowercase().contains(&q))).collect())
+    }
+
+    /// Shows the file list in place of the snippets, with focus. The row of
+    /// the current filter is selected.
+    fn open_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(edit) = &mut self.edit else { return };
+        if edit.files.is_none() {
+            edit.files = Some(FilePick::default());
+            let current = edit.file.clone();
+            let row = self.file_rows().and_then(|rows| rows.iter().position(|(f, _)| *f == current)).unwrap_or(0);
+            if let Some(pick) = self.edit.as_mut().and_then(|e| e.files.as_mut()) {
+                pick.selected = row;
+            }
+            self.scroll.scroll_to_item(row);
+        }
+        self.place_edit();
+        self.focus_list(window, cx);
+    }
+
+    /// Leaves the file list. With `file`, the snippets of that file show
+    /// (`Some(None)` means all files). Without, the filter stays as it was.
+    fn close_files(&mut self, file: Option<Option<String>>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(edit) = &mut self.edit else { return };
+        edit.files = None;
+        // Only a new filter changes the rows, so the selected row stays.
+        if let Some(file) = file.filter(|f| *f != edit.file) {
+            popup_core::log::line(&format!("ui file filter: {}", if file.is_some() { "one file" } else { "all files" }));
+            edit.file = file;
+            self.refresh(cx);
+        } else {
+            self.scroll.scroll_to_item(self.selected);
+        }
+        self.place_edit();
+        self.focus_list(window, cx);
+    }
+
+    /// Keys while the file list shows. Returns false when the file list
+    /// does not show. It takes every other key, so a key for the hidden
+    /// snippet rows, such as Ctrl+1, does nothing.
+    fn files_key(&mut self, ctrl: bool, key: &str, key_char: Option<&str>, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let n = self.file_rows().map_or(0, |r| r.len());
+        let Some(pick) = self.edit.as_mut().and_then(|e| e.files.as_mut()) else { return false };
+        match (ctrl, key) {
+            (false, "up") => pick.selected = pick.selected.saturating_sub(1),
+            (false, "down") => pick.selected = (pick.selected + 1).min(n.saturating_sub(1)),
+            (false, "enter") => {
+                let row = pick.selected;
+                self.pick_file(row, window, cx);
+                return true;
+            }
+            (false, "escape") | (true, "o") => {
+                self.close_files(None, window, cx);
+                return true;
+            }
+            (false, "backspace") => {
+                pick.query.pop();
+                pick.selected = 0;
+            }
+            (false, _) => match key_char {
+                Some(c) if !c.chars().any(char::is_control) => {
+                    pick.query.push_str(c);
+                    pick.selected = 0;
+                }
+                _ => return true,
+            },
+            _ => return true,
+        }
+        let row = pick.selected;
+        self.scroll.scroll_to_item(row);
+        self.place_edit();
+        cx.notify();
+        true
+    }
+
+    /// Picks the file of `row` in the file list.
+    fn pick_file(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((file, _)) = self.file_rows().and_then(|rows| rows.into_iter().nth(row)) {
+            self.close_files(Some(file), window, cx);
+        }
+    }
+
+    /// What Esc does next in the edit session, for the status line.
+    fn esc_hint(&self) -> &'static str {
+        match &self.edit {
+            Some(e) if e.files.is_some() => "Esc: back to snippets",
+            Some(e) if e.form.is_some() => "Esc: list only",
+            Some(_) => "Esc: close",
+            None => "",
+        }
     }
 
     /// The line under the rows. It shows no key help, only a note, the load
@@ -1107,15 +1304,12 @@ impl Popup {
     /// edit form. The popup stays on screen meanwhile; the form opens in it.
     fn open_from_popup(&mut self, edit: bool) {
         let request = if edit {
-            let entry = self.snap.as_ref().zip(self.results.get(self.selected)).map(|(s, &i)| &s[i]);
-            match entry {
-                Some(e) => editor::Request::Find {
-                    trigger: e.trigger.clone(),
-                    label: e.label.clone(),
-                    keyword: self.keyword.clone(),
-                    prefix: self.trigger.clone(),
-                },
-                None => editor::Request::Browse,
+            match self.find_request(self.selected) {
+                Some(r) => r,
+                None => {
+                    popup_core::log::line("ui ignored edit: no snippet row");
+                    return;
+                }
             }
         } else {
             editor::Request::New { trigger: Some(format!("{}{}", self.trigger, self.keyword)) }
@@ -1273,7 +1467,7 @@ impl Render for Popup {
                             if this.form_view().is_some() {
                                 this.select_row(row, window, cx);
                             } else {
-                                this.insert_from_list(row, cx);
+                                this.insert_from_list(row, window, cx);
                             }
                         }))
                         .on_mouse_down(
@@ -1351,20 +1545,18 @@ impl Render for Popup {
         });
 
         let status = self.status();
+        // In the file list, its rows replace the snippets.
+        let rows: Vec<AnyElement> = match self.file_rows() {
+            Some(files) => self.render_file_rows(files, &theme, cx),
+            None => rows.map(IntoElement::into_any_element).collect(),
+        };
+        let body = div().flex_1().min_h_0().flex().flex_col().p(px(PAD)).child(
+            div().id("results").flex_1().overflow_y_scroll().track_scroll(&self.scroll).children(rows),
+        );
 
-        let list = div()
-            .flex()
-            .flex_col()
-            .p(px(PAD))
-            .child(
-                div()
-                    .id("results")
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.scroll)
-                    .children(rows),
-            )
-            .children(status.map(|status| {
+        let root = div().size_full().flex().bg(theme.background).text_color(theme.foreground);
+        let Some(edit) = &self.edit else {
+            let list = body.children(status.map(|status| {
                 div()
                     .h(px(STATUS_H))
                     .flex()
@@ -1375,23 +1567,86 @@ impl Render for Popup {
                     .truncate()
                     .child(status)
             }));
-
-        let root = div().size_full().flex().bg(theme.background).text_color(theme.foreground);
-        let Some(edit) = &self.edit else { return root.child(list.size_full()) };
-        // In the edit session the list takes keys when it has focus. A click
-        // beside the rows gives it focus. A colored edge shows the focus.
+            return root.child(list.size_full());
+        };
+        // In the edit session the list has a header with the file filter,
+        // and its status line always shows what Esc does next.
+        let file_label = match (&edit.files, &edit.file) {
+            (Some(_), _) => "Pick a file".to_string(),
+            (None, Some(f)) => f.clone(),
+            (None, None) => "All files".to_string(),
+        };
+        let header = div()
+            .h(px(HEAD_H))
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                Button::new("file-filter")
+                    .label(file_label)
+                    .icon(IconName::ChevronDown)
+                    .ghost()
+                    .xsmall()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        if this.edit.as_ref().is_some_and(|e| e.files.is_some()) {
+                            this.close_files(None, window, cx);
+                        } else {
+                            this.open_files(window, cx);
+                        }
+                    })),
+            )
+            .child(div().flex_1())
+            .child(div().text_xs().text_color(theme.muted_foreground).child("Ctrl+O"));
+        let status_line = div()
+            .h(px(STATUS_H))
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .mx(px(PAD))
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .child(div().flex_1().min_w_0().truncate().child(match &edit.files {
+                Some(pick) => SharedString::from(pick.query.clone()),
+                None => status.unwrap_or_default(),
+            }))
+            .child(div().flex_none().child(self.esc_hint()));
+        // The list takes keys when it has focus. A click beside the rows
+        // gives it focus. A colored edge shows the focus.
         let list_focused = self.list_focus.is_focused(window);
-        let list = list
+        let list = div()
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(body)
+            .child(status_line)
             .track_focus(&self.list_focus)
             .on_key_down(cx.listener(Self::list_key))
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, window, cx| this.focus_list(window, cx)));
         let root = root
             // Alt+Up and Alt+Down select the row above or below, from the
-            // form too. An open form shows it.
+            // form too. An open form shows it. Ctrl+O opens or closes the
+            // file list from anywhere in the session.
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                     let k = &ev.keystroke;
                     let m = k.modifiers;
+                    if m.control && !m.alt && !m.shift && !m.platform && k.key == "o" {
+                        cx.stop_propagation();
+                        if this.edit.as_ref().is_some_and(|e| e.files.is_some()) {
+                            this.close_files(None, window, cx);
+                        } else {
+                            this.open_files(window, cx);
+                        }
+                        return;
+                    }
                     if !m.alt || m.control || m.shift || m.platform {
+                        return;
+                    }
+                    if this.edit.as_ref().is_some_and(|e| e.files.is_some()) {
                         return;
                     }
                     let row = match k.key.as_str() {
@@ -1413,7 +1668,9 @@ impl Render for Popup {
         match &edit.form {
             None => root.child(list.size_full()),
             // The list keeps its width on the left, and the form fills the
-            // rest.
+            // rest. The form fades in and slides in a little from the list,
+            // so the eye sees where it came from. The window itself does not
+            // animate: a stepped resize flickers.
             Some((view, _)) => root
                 .child(
                     list.w(px(WIDTH))
@@ -1422,8 +1679,61 @@ impl Render for Popup {
                         .border_r_2()
                         .border_color(if list_focused { theme.primary } else { theme.border }),
                 )
-                .child(div().flex_1().min_w_0().h_full().child(view.clone())),
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .relative()
+                        .child(view.clone())
+                        .with_animation(
+                            ("form-in", edit.form_gen),
+                            Animation::new(FORM_IN).with_easing(ease_out_quint()),
+                            |d, t| d.opacity(t).left(px(16.0 * (1.0 - t))),
+                        ),
+                ),
         }
+    }
+}
+
+impl Popup {
+    /// The rows of the file list. The current filter has the colored bar.
+    fn render_file_rows(&self, files: Vec<(Option<String>, String)>, theme: &component::Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let Some(edit) = &self.edit else { return Vec::new() };
+        let selected = edit.files.as_ref().map_or(0, |p| p.selected);
+        let count = files.len();
+        files
+            .into_iter()
+            .enumerate()
+            .map(|(row, (file, text))| {
+                let is_selected = row == selected;
+                let is_current = file == edit.file;
+                div()
+                    .id(("file", row))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .h(px(ROW_H))
+                    .pl_1()
+                    .pr_2()
+                    .when(row + 1 < count, |d| d.border_b_1().border_color(theme.border))
+                    .when(is_selected, |d| d.bg(theme.primary.opacity(0.3)))
+                    .when(!is_selected, |d| d.hover(|s| s.bg(theme.list_hover)))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.pick_file(row, window, cx)))
+                    .child(div().w(px(3.0)).h(px(ROW_H - 8.0)).flex_none().rounded_full().when(is_current, |d| d.bg(theme.primary)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .overflow_hidden()
+                            .text_sm()
+                            .truncate()
+                            .when(file.is_none(), |d| d.text_color(theme.muted_foreground))
+                            .when(is_current, |d| d.font_weight(FontWeight::SEMIBOLD))
+                            .child(text),
+                    )
+                    .into_any_element()
+            })
+            .collect()
     }
 }
 

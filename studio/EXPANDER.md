@@ -2,7 +2,7 @@
 
 Status: phase one built on 2026-11-15, not yet used for a day. Forms and `choice` variables built on 2026-11-15. See [Build notes](#build-notes) for what differs from this design and what the tests found.
 
-`snip` grows into the one resident program for daily work. It expands full triggers, as the espanso daemon does, and keeps the `;;` popup. After phase one, you stop espanso and run only this program.
+`snip` grows into the one resident program for daily work. It expands full triggers, as the espanso daemon does, and keeps the `,,` popup. After phase one, you stop espanso and run only this program.
 
 The program reuses three library crates of this repository: `espanso-config` reads the configuration, `espanso-match` finds triggers, and `espanso-render` fills variables. The espanso worker connects these crates through `espanso-engine`. The program does not use `espanso-engine`. It copies the small parts of that glue that it needs.
 
@@ -18,7 +18,7 @@ The program reuses three library crates of this repository: `espanso-config` rea
 | `undo_backspace` (Backspace right after an expansion brings the trigger back) | 1 |
 | `force_mode` (`keys` types, `clipboard` pastes) | 1 |
 | Regex triggers | 1, because the matcher supports them at no extra cost |
-| The `;;` popup inserts any snippet, also snippets with variables | 1 |
+| The `,,` popup inserts any snippet, also snippets with variables | 1 |
 | Forms and `choice` variables, rebuilt in gpui | 2 |
 | Image snippets (`image_path`) | 2 |
 | Automatic reload of changed configuration files | 2 |
@@ -55,7 +55,7 @@ The program ignores its own injected key presses, as now. espanso no longer runs
 
 - If espanso still runs, both programs expand the same trigger. At start, the program checks for `espanso.exe` and logs a warning.
 - A `shell` variable that waits forever blocks the next expansion. espanso has the same limit.
-- The trigger prefix `;;` opens the popup, and many triggers start with `;;`. The popup stays open while you type a full trigger. When the trigger matches, the expansion closes the popup.
+- The trigger prefix `,,` opens the popup, and many triggers start with `,,`. The popup stays open while you type a full trigger. When the trigger matches, the expansion closes the popup.
 
 ## Build notes
 
@@ -118,8 +118,9 @@ snip waits instead:
 - When a typed trigger is also the start of a longer trigger of the active configuration, it does not expand at once. Regex triggers do not count.
 - If the next keys make the longer trigger, the longer one expands. If it is also the start of a longer trigger, it waits again.
 - If a key fits no longer trigger, the short trigger expands. The engine erases the trigger and the keys after it, and types the keys again after the text.
-- If no key comes in 500 ms, the short trigger expands. `--prefix-wait-ms` changes this time.
-- While the `;;` popup is open, the wait does not end by time, because the user picks in the popup. For example, `;;anki` shows `;;anki` and `;;anki2`, and neither expands on its own. The next key decides: Enter inserts the selected snippet, and a key that fits no longer trigger expands the short one. If the popup closes without a key, nothing expands.
+- Changed on 2026-11-18: the wait has no time limit. An accept key expands the short trigger: Space, Tab or Enter without the popup, and Space in the popup. The hook swallows that key, so the application never gets it. For example, Enter after `,,gm` in a shell expands `,,gm` and does not run the line. `--prefix-wait-ms N` with N above 0 brings back the old rule: if no key comes in N ms, the short trigger expands.
+- The hook knows that a trigger waits from a flag that the engine sets after each key. The engine thread handles a key in well under a millisecond, so the flag is ready before the next key. If an accept key still comes after the wait ended, the engine types the key again.
+- While the `;;` popup is open, the wait does not end by time, because the user picks in the popup. For example, `;;anki` shows `;;anki` and `;;anki2`, and neither expands on its own. The next key decides: Enter or Tab inserts the selected snippet, Space expands the short trigger, and a key that fits no longer trigger expands the short one. If the popup closes without a key, nothing expands.
 - Backspace erases a key after the trigger and keeps the wait. A Backspace on the trigger itself, an arrow key or a click ends the wait, and nothing expands.
 
 When a trigger matches, espanso's matcher drops its state. So while a trigger waits, the engine compares the typed keys with its own list of triggers. It follows the `propagate_case` setting of each trigger for upper and lower case.

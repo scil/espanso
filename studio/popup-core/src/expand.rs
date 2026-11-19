@@ -91,6 +91,10 @@ pub enum Input {
     /// Home, End, Escape, a key with Ctrl, Alt or Win, a mouse click. The
     /// matcher forgets the keys it saw.
     Reset,
+    /// A confirm key (Space, Tab or Enter, as `' '`, `'\t'`, `'\n'`) that
+    /// the hook swallowed because a trigger was waiting. It expands the
+    /// waiting trigger. If none waits, the key is typed again.
+    Confirm(char),
 }
 
 /// The foreground application, for per-application configurations
@@ -336,6 +340,15 @@ impl Engine {
                 self.pending = None;
                 None
             }
+            Input::Confirm(c) => {
+                if let Some(p) = self.pending.take() {
+                    return self.finish(p.chosen, p.ties, &p.app, &p.extra);
+                }
+                // The wait ended just before the key came. The application
+                // never got the key, so type it again.
+                self.undo = undo;
+                Some(Expansion { erase: 0, text: c.to_string(), lefts: 0, method: Method::Keys, id: -1 })
+            }
             Input::Char(c) => {
                 let key = match c {
                     '\n' => MatchKey::Enter,
@@ -478,8 +491,9 @@ impl Engine {
         (index < all.len()).then(|| all.swap_remove(index))
     }
 
-    /// Whether a trigger waits for the next key. If no key comes in time,
-    /// the caller calls [`Engine::flush`].
+    /// Whether a trigger waits for the next key. A confirm key
+    /// ([`Input::Confirm`]) expands it. With a time limit, the caller calls
+    /// [`Engine::flush`] when no key comes in time.
     pub fn waiting(&self) -> bool {
         self.pending.is_some()
     }
@@ -1228,6 +1242,24 @@ matches:
         typed(&mut e, ";sux");
         assert_eq!(text(e.flush()), Some((4, "update x".into(), 0)));
         assert_eq!(e.flush(), None);
+    }
+
+    #[test]
+    fn confirm_expands_the_prefix_without_the_key() {
+        let (mut e, _d) = engine(&[("match/base.yml", PREFIX)]);
+        typed(&mut e, ";su");
+        assert_eq!(text(e.key(Input::Confirm(' '), App::default)), Some((3, "update ".into(), 0)));
+        assert!(!e.waiting());
+        // Keys that fit a longer trigger are typed again after the text.
+        typed(&mut e, " ;sux");
+        assert_eq!(text(e.key(Input::Confirm('\n'), App::default)), Some((4, "update x".into(), 0)));
+    }
+
+    #[test]
+    fn confirm_without_a_wait_types_the_key() {
+        let (mut e, _d) = engine(&[("match/base.yml", PREFIX)]);
+        typed(&mut e, "ab");
+        assert_eq!(text(e.key(Input::Confirm('\t'), App::default)), Some((0, "\t".into(), 0)));
     }
 
     #[test]

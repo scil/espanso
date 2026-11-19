@@ -12,7 +12,7 @@ use crate::focus::{Insert, LongText};
 /// - `--query TEXT`: start with this search text.
 /// - `--base DIR`: espanso folder (else `SNIP_BASE`, else the standard one).
 /// - `--trigger TEXT`: characters that open the resident popup (`snip`).
-///   The default is `;;`.
+///   The default is `,,`.
 /// - `--log FILE`: write the resident popup's events to FILE. It records
 ///   no typed text.
 /// - `--allow-injected`: the hook also reads injected key presses. Use it
@@ -24,8 +24,9 @@ use crate::focus::{Insert, LongText};
 /// - `--type-chunk N`, `--type-gap-ms N`: typing sends N characters per
 ///   call (default 1) and waits N ms between calls (default 5).
 /// - `--prefix-wait-ms N`: a typed trigger that is also the start of a longer
-///   trigger waits for the next key. If no key comes in N ms (default 500),
-///   the short trigger expands.
+///   trigger waits for the next key. Space, Tab or Enter expands it, and the
+///   key is not typed. With N above 0, the short trigger also expands when
+///   no key comes in N ms. The default is 0: no time limit.
 /// - `--tab accept|move|ignore`: what Tab does in the resident popup.
 ///   `accept` (default) inserts the selected row, as Enter does. `move`
 ///   selects the next row, and Shift+Tab the previous one. `ignore` leaves
@@ -55,11 +56,11 @@ impl Default for Args {
             exit_after_ms: None,
             query: String::new(),
             base: None,
-            trigger: ";;".to_string(),
+            trigger: ",,".to_string(),
             allow_injected: false,
             log: None,
             insert: Insert::default(),
-            prefix_wait: std::time::Duration::from_millis(500),
+            prefix_wait: std::time::Duration::ZERO,
             tab: crate::hook::TabKey::default(),
         }
     }
