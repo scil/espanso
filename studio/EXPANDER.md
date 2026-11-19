@@ -172,7 +172,7 @@ Rules:
 - The checked rows keep their order in the text, not the order in which you checked them. A line break joins two rows of one paragraph. One blank line joins two paragraphs. The line break at the end of a YAML `|` block stays.
 - All paragraphs start checked. `snip: { pick: many, checked: none }` starts with none checked.
 - A snippet with only one paragraph inserts without a list.
-- In the `,,` popup, Ctrl+P on a row inserts that snippet as a paragraph pick. This works for every snippet, with or without a `snip:` key. If the snippet sets `checked: none`, no paragraph starts checked. Else all paragraphs start checked. Added on 2026-11-19.
+- In the `,,` popup, Caps Lock or Ctrl+P on a row inserts that snippet as a paragraph pick. Caps Lock then does not switch to capitals. This works for every snippet, with or without a `snip:` key. If the snippet sets `checked: none`, no paragraph starts checked. Else all paragraphs start checked. Added on 2026-11-19.
 - espanso ignores the `snip:` key and inserts the whole text. A bad value, for example `pick: one`, gives a `warning` in the log and in `snipctl validate`, and the snippet expands without a list.
 
 The list:

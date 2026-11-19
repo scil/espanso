@@ -102,7 +102,7 @@ In Notepad on Windows 11, UI Automation found the exact caret in 16 to 18 ms.
 
 1. You type the trigger, `;;` by default. The popup opens below the caret. It lists the snippets whose triggers start with `;;` first.
 2. You type the keyword. The characters go into the target application, and the popup filters its list after each one. Many triggers start with the popup trigger, so the popup compares the keyword with each snippet trigger without that prefix. For the keyword `doc`, `;;doc` comes first.
-3. Up and Down select a snippet. Enter or Tab inserts it. Ctrl+1 to Ctrl+9 inserts the row with that number. Ctrl+P inserts the selected snippet as a paragraph pick. A list with check boxes asks which paragraphs to insert. This works for every snippet, with or without a `snip: { pick: many }` key (see [Paragraph picks](EXPANDER.md#paragraph-picks)). After each typed key, the first row is selected, so Enter or Tab inserts the first row. The `--tab` option changes what Tab does.
+3. Up and Down select a snippet. Enter or Tab inserts it. Ctrl+1 to Ctrl+9 inserts the row with that number. Caps Lock or Ctrl+P inserts the selected snippet as a paragraph pick. A list with check boxes asks which paragraphs to insert. This works for every snippet, with or without a `snip: { pick: many }` key (see [Paragraph picks](EXPANDER.md#paragraph-picks)). After each typed key, the first row is selected, so Enter or Tab inserts the first row. The `--tab` option changes what Tab does.
 
 `;;.` repeats the last search. If `.` is the first keyword character, snip replaces it with the keyword of the last `;;` search, inserted or not. snip types that keyword into the application, and you can go on typing. Before the first search, `.` is an ordinary keyword character.
 
@@ -135,7 +135,7 @@ The insert flags in [Inserting text](#inserting-text) also apply.
 ### How the resident mode works
 
 - `popup_core::hook` installs low-level keyboard and mouse hooks (`WH_KEYBOARD_LL`, `WH_MOUSE_LL`) on a thread of its own. A state machine keeps the last typed characters and the keyword. It has no Windows code, so its tests run anywhere.
-- The hook passes characters and Backspace to the application. It swallows Up, Down, Enter, Tab (unless `--tab ignore`), Escape, Ctrl+E, Ctrl+N and clicks inside the popup, right clicks too. It also swallows Right and Ctrl+P with a result, and Ctrl+1 to Ctrl+9 with that row. The application never sees these keys.
+- The hook passes characters and Backspace to the application. It swallows Up, Down, Enter, Tab (unless `--tab ignore`), Escape, Ctrl+E, Ctrl+N and clicks inside the popup, right clicks too. It also swallows Right, Caps Lock and Ctrl+P with a result, and Ctrl+1 to Ctrl+9 with that row. The application never sees these keys.
 - The hook reads characters with `ToUnicodeEx` in the keyboard layout of the foreground window. Flag 4 keeps dead keys working in the application.
 - The hook ignores injected input for the keyword, so espanso's expansions and the popup's own key presses never extend it. Injected input from another program closes an open popup, because espanso then replaced the text at the caret. The popup marks its own input with `dwExtraInfo = OWN_INPUT`, so `--allow-injected` still ignores it.
 - A controller thread finds the caret for each session, so UI Automation never blocks the hook or the UI thread.

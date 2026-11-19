@@ -216,8 +216,12 @@ pub enum Key {
     /// Tab with Shift.
     ShiftTab,
     Escape,
-    /// Shift or Caps Lock alone. They never change the state.
+    /// Shift alone, or Caps Lock with Ctrl, Alt or Win. It never changes
+    /// the state.
     Modifier,
+    /// Caps Lock alone. With a result in the popup it inserts the selected
+    /// snippet as a paragraph pick. Else it acts as [`Key::Modifier`].
+    CapsLock,
     /// The Ctrl key alone. It starts a shortcut such as Ctrl+E.
     Ctrl,
     /// Ctrl with a letter key, and no Alt or Win. The letter is lowercase.
@@ -349,7 +353,7 @@ impl Machine {
             (_, Key::Backspace) => Some(Input::Backspace),
             (_, Key::Enter) => Some(Input::Char('\n')),
             (_, Key::Tab) => Some(Input::Char('\t')),
-            (_, Key::Modifier | Key::Ctrl) => None,
+            (_, Key::Modifier | Key::CapsLock | Key::Ctrl) => None,
             (
                 _,
                 Key::Up
@@ -423,7 +427,7 @@ impl Machine {
             Key::Backspace => {
                 self.recent.pop();
             }
-            Key::Modifier | Key::Ctrl => {}
+            Key::Modifier | Key::CapsLock | Key::Ctrl => {}
             _ => self.recent.clear(),
         }
     }
@@ -498,15 +502,15 @@ impl Machine {
                 self.cancel("escape");
                 Verdict::Swallow
             }
-            Key::Modifier | Key::Ctrl => Verdict::Pass,
+            Key::CtrlLetter('p') | Key::CapsLock if self.shared.results.load(Ordering::Relaxed) > 0 => {
+                crate::log::line("hook accept as paragraph pick");
+                self.emit(HookEvent::AcceptParagraphs);
+                Verdict::Swallow
+            }
+            Key::Modifier | Key::CapsLock | Key::Ctrl => Verdict::Pass,
             Key::CtrlLetter('e') | Key::Right if self.shared.results.load(Ordering::Relaxed) > 0 => {
                 crate::log::line("hook edit");
                 self.emit(HookEvent::Edit);
-                Verdict::Swallow
-            }
-            Key::CtrlLetter('p') if self.shared.results.load(Ordering::Relaxed) > 0 => {
-                crate::log::line("hook accept as paragraph pick");
-                self.emit(HookEvent::AcceptParagraphs);
                 Verdict::Swallow
             }
             Key::CtrlLetter('n') => {
@@ -589,7 +593,7 @@ impl Machine {
                 self.cancel("escape in pick list");
                 Verdict::Swallow
             }
-            Key::Modifier | Key::Ctrl => Verdict::Pass,
+            Key::Modifier | Key::CapsLock | Key::Ctrl => Verdict::Pass,
             Key::CtrlDigit(n) if self.digit_row(n) => Verdict::Swallow,
             Key::Right | Key::CtrlLetter(_) | Key::CtrlDigit(_) | Key::Other => {
                 self.cancel("other key in pick list");
@@ -797,11 +801,14 @@ mod win {
     unsafe fn classify(kb: &KBDLLHOOKSTRUCT) -> Key {
         let vk = kb.vkCode as u16;
         let is = |k: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY| k.0 == vk;
-        if [VK_SHIFT, VK_LSHIFT, VK_RSHIFT, VK_CAPITAL].iter().any(|k| is(*k)) {
+        if [VK_SHIFT, VK_LSHIFT, VK_RSHIFT].iter().any(|k| is(*k)) {
             return Key::Modifier;
         }
         let (ctrl, alt) = (down(VK_CONTROL.0 as i32), down(VK_MENU.0 as i32));
         let win = down(VK_LWIN.0 as i32) || down(VK_RWIN.0 as i32);
+        if is(VK_CAPITAL) {
+            return if ctrl || alt || win { Key::Modifier } else { Key::CapsLock };
+        }
         if [VK_CONTROL, VK_LCONTROL, VK_RCONTROL].iter().any(|k| is(*k)) && !alt && !win {
             return Key::Ctrl;
         }
@@ -1127,6 +1134,22 @@ mod tests {
         shared.set_results(1);
         assert_eq!(m.key(Key::CtrlLetter('p')), Verdict::Swallow);
         assert_eq!(events(&rx).last(), Some(&HookEvent::AcceptParagraphs));
+    }
+
+    #[test]
+    fn caps_lock_accepts_as_a_paragraph_pick() {
+        let (mut m, rx, shared) = machine();
+        typed(&mut m, "//si");
+        // Without a result, Caps Lock goes to the application and the
+        // popup stays.
+        assert_eq!(m.key(Key::CapsLock), Verdict::Pass);
+        assert!(m.is_active());
+        shared.set_results(1);
+        assert_eq!(m.key(Key::CapsLock), Verdict::Swallow);
+        assert_eq!(events(&rx).last(), Some(&HookEvent::AcceptParagraphs));
+        // In a pick list, Caps Lock goes to the application.
+        shared.start_pick_many();
+        assert_eq!(m.key(Key::CapsLock), Verdict::Pass);
     }
 
     #[test]
