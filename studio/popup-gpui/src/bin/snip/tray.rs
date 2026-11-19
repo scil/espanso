@@ -22,6 +22,7 @@ pub enum Action {
     OpenLog,
     StartAtSignIn(bool),
     RestartAsAdmin,
+    Settings,
     Quit,
 }
 
@@ -64,6 +65,8 @@ impl Tray {
         menu.append(&MenuItem::with_id("log", "Open log", true, None))
             .map_err(|e| e.to_string())?;
         menu.append(&PredefinedMenuItem::separator()).map_err(|e| e.to_string())?;
+        menu.append(&MenuItem::with_id("settings", "Settings...", true, None))
+            .map_err(|e| e.to_string())?;
         menu.append(&sign_in).map_err(|e| e.to_string())?;
         if !admin && admin_script().is_some() {
             menu.append(&MenuItem::with_id("admin", "Restart as administrator", true, None))
@@ -98,6 +101,7 @@ impl Tray {
                 "log" => Some(Action::OpenLog),
                 "sign-in" => Some(Action::StartAtSignIn(self.sign_in.is_checked())),
                 "admin" => Some(Action::RestartAsAdmin),
+                "settings" => Some(Action::Settings),
                 "quit" => Some(Action::Quit),
                 _ => None,
             });
@@ -115,9 +119,15 @@ impl Tray {
         let _ = self.icon.set_tooltip(Some(tip));
     }
 
-    /// Puts the check mark back after a failed change.
+    /// Puts the check mark back after a failed change, or shows a change
+    /// made in the settings window.
     pub fn set_sign_in_checked(&self, on: bool) {
         self.sign_in.set_checked(on);
+    }
+
+    /// Shows a pause made in the settings window.
+    pub fn set_pause_checked(&self, on: bool) {
+        self.pause.set_checked(on);
     }
 }
 
@@ -242,6 +252,11 @@ fn admin_script() -> Option<PathBuf> {
     script.is_file().then_some(script)
 }
 
+/// Whether "Restart as administrator" can work: its script is there.
+pub fn can_restart_as_admin() -> bool {
+    admin_script().is_some()
+}
+
 /// Starts the script that stops this process and starts snip again with
 /// administrator rights. Windows asks for consent (UAC).
 pub fn restart_as_admin() -> Result<(), String> {
@@ -254,6 +269,14 @@ pub fn restart_as_admin() -> Result<(), String> {
         "start".into(),
     ];
     quiet("pwsh").args(args).spawn().map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// Starts a new snip with the command line of this process. The caller
+/// quits right after. The new process has the rights of this one, so an
+/// administrator snip restarts without a consent prompt.
+pub fn restart() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    Command::new(exe).args(std::env::args_os().skip(1)).spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
 /// Opens a folder in Explorer, or a file in its default program. The call

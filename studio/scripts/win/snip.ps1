@@ -28,4 +28,4 @@ $logDir = Join-Path $env:LOCALAPPDATA 'snip'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $log = Join-Path $logDir 'events.log'
 if (Test-Path $log) { Move-Item -Force $log (Join-Path $logDir 'events.prev.log') }
-Start-Process -FilePath $exe -ArgumentList @('--timing', '--log', "`"$log`"", '--tab', 'move')
+Start-Process -FilePath $exe -ArgumentList @('--timing', '--log', "`"$log`"")

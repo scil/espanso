@@ -1,8 +1,11 @@
 use std::path::PathBuf;
 
 use crate::focus::{Insert, LongText};
+use crate::settings::{self, Settings};
 
-/// Command line shared by both popups.
+/// Command line shared by both popups. The resident popup (`snip`) starts
+/// from its settings file ([`crate::settings`]), and each flag below wins
+/// over the key of the same name there.
 ///
 /// - `--type`: type the chosen text into the previous window. Without it,
 ///   the text goes to standard output (for an espanso `shell` variable).
@@ -45,6 +48,9 @@ pub struct Args {
     pub insert: Insert,
     pub prefix_wait: std::time::Duration,
     pub tab: crate::hook::TabKey,
+    /// The settings keys (`trigger`, `tab`, ...) that a command line flag
+    /// set. They win over the settings file.
+    pub from_cli: Vec<&'static str>,
 }
 
 impl Default for Args {
@@ -62,15 +68,54 @@ impl Default for Args {
             insert: Insert::default(),
             prefix_wait: std::time::Duration::ZERO,
             tab: crate::hook::TabKey::default(),
+            from_cli: Vec::new(),
         }
     }
 }
 
 impl Args {
+    /// The command line over the defaults.
     pub fn parse() -> Args {
+        Args::default().with_cli(std::env::args().skip(1)).install()
+    }
+
+    /// The command line over the settings file `file` (see
+    /// [`crate::settings`]).
+    pub fn parse_with(file: &Settings) -> Args {
+        Args::from_settings(file).with_cli(std::env::args().skip(1)).install()
+    }
+
+    fn install(self) -> Args {
+        crate::focus::set_insert(self.insert);
+        self
+    }
+
+    /// The defaults with the values of the settings file.
+    pub fn from_settings(s: &Settings) -> Args {
         let mut out = Args::default();
-        let mut it = std::env::args().skip(1);
+        if !s.trigger.is_empty() {
+            out.trigger = s.trigger.clone();
+        }
+        out.tab = crate::hook::TabKey::parse(&s.tab).unwrap_or_default();
+        out.insert.long = if s.long_text == "type" { LongText::Type } else { LongText::Paste };
+        out.insert.short_limit = s.short_limit;
+        out.insert.pace.chunk = s.type_chunk.max(1);
+        out.insert.pace.gap = std::time::Duration::from_millis(s.type_gap_ms);
+        out.prefix_wait = std::time::Duration::from_millis(s.prefix_wait_ms);
+        out.log = if s.log { settings::log_path() } else { None };
+        out
+    }
+
+    /// Applies the flags in `args` and records the settings keys they set.
+    pub fn with_cli(mut self, args: impl IntoIterator<Item = String>) -> Args {
+        let out = &mut self;
+        let mut it = args.into_iter();
         while let Some(a) = it.next() {
+            if let Some(key) = setting_key(&a) {
+                if !out.from_cli.contains(&key) {
+                    out.from_cli.push(key);
+                }
+            }
             match a.as_str() {
                 "--type" => out.type_text = true,
                 "--timing" => out.timing = true,
@@ -117,7 +162,48 @@ impl Args {
                 other => eprintln!("ignored argument: {other}"),
             }
         }
-        crate::focus::set_insert(out.insert);
-        out
+        self
+    }
+}
+
+/// The settings key of a command line flag, if it has one.
+fn setting_key(flag: &str) -> Option<&'static str> {
+    Some(match flag {
+        "--trigger" => "trigger",
+        "--tab" => "tab",
+        "--long-text" => "long-text",
+        "--short-limit" => "short-limit",
+        "--type-chunk" => "type-chunk",
+        "--type-gap-ms" => "type-gap-ms",
+        "--prefix-wait-ms" => "prefix-wait-ms",
+        "--log" => "log",
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cli(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| a.to_string()).collect()
+    }
+
+    #[test]
+    fn the_file_sets_the_values() {
+        let s = Settings { trigger: ";;".into(), tab: "move".into(), prefix_wait_ms: 300, ..Settings::default() };
+        let a = Args::from_settings(&s).with_cli(cli(&[]));
+        assert_eq!(a.trigger, ";;");
+        assert_eq!(a.tab, crate::hook::TabKey::Move);
+        assert_eq!(a.prefix_wait, std::time::Duration::from_millis(300));
+        assert!(a.from_cli.is_empty());
+    }
+
+    #[test]
+    fn a_flag_wins_over_the_file_and_is_recorded() {
+        let s = Settings { tab: "move".into(), ..Settings::default() };
+        let a = Args::from_settings(&s).with_cli(cli(&["--tab", "ignore", "--timing"]));
+        assert_eq!(a.tab, crate::hook::TabKey::Ignore);
+        assert_eq!(a.from_cli, vec!["tab"]);
     }
 }

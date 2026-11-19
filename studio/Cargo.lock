@@ -6299,12 +6299,15 @@ name = "popup-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dirs",
  "espanso-config",
  "espanso-match",
  "espanso-render",
+ "serde",
  "serde_norway",
  "snip-core",
  "tempfile",
+ "toml 0.8.23",
  "unicode-segmentation",
  "windows 0.62.2",
 ]

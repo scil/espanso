@@ -23,6 +23,7 @@ pub mod form;
 pub mod hook;
 pub mod log;
 pub mod place;
+pub mod settings;
 pub mod timing;
 
 #[cfg(windows)]

@@ -48,6 +48,10 @@ pub enum Request {
     Find { trigger: String, label: String },
     /// A new snippet. `trigger` fills the first trigger.
     New { trigger: Option<String> },
+    /// The holder wants to show its settings panel instead of the form.
+    /// The editor only asks about unsaved edits and then sends
+    /// [`EditorEvent::Settings`].
+    Settings,
 }
 
 /// What the editor tells the popup that holds it.
@@ -58,6 +62,9 @@ pub enum EditorEvent {
     Done,
     /// Ctrl+F: the holder focuses its list.
     FocusList,
+    /// A [`Request::Settings`] passed the unsaved edits check: the holder
+    /// shows its settings panel.
+    Settings,
 }
 
 impl EventEmitter<EditorEvent> for EditorView {}
@@ -293,6 +300,10 @@ impl EditorView {
 
     fn run(&mut self, step: Request, window: &mut Window, cx: &mut Context<Self>) {
         self.pending = None;
+        if matches!(step, Request::Settings) {
+            cx.emit(EditorEvent::Settings);
+            return;
+        }
         self.load(step, window, cx);
     }
 
@@ -370,6 +381,8 @@ impl EditorView {
                     }
                 }
             }
+            // `run` sends it to the holder and never loads it.
+            Request::Settings => {}
             Request::New { trigger } => {
                 let trigger = trigger.unwrap_or_default();
                 let text = format!("trigger: {}\nreplace: \"\"", quote(&trigger));
@@ -895,6 +908,7 @@ impl EditorView {
         let what = match self.pending.as_ref()? {
             Request::New { .. } => "start a new snippet",
             Request::Find { .. } => "open the snippet",
+            Request::Settings => "open the settings",
         };
         Some(
             div()

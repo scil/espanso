@@ -16,11 +16,13 @@
 //! instead, and the hook swallows the keys that filter it.
 //!
 //! A tray icon ([`tray`]) offers pause, reload and other common actions. See
-//! `studio/EDITOR.md`.
+//! `studio/EDITOR.md`. The edit session can show the settings panel
+//! ([`settings_view`]) in place of the edit form.
 #![windows_subsystem = "windows"]
 
 mod editor;
 mod form_view;
+mod settings_view;
 mod tray;
 
 use std::collections::HashMap;
@@ -33,6 +35,7 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::component::scroll::ScrollbarMode;
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::base::Selectable;
 use gpui_kit::component::{self as component, ActiveTheme, IconName, Sizable, Theme};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -480,6 +483,8 @@ struct Popup {
     /// The focus of the list while the popup has focus: keys then search,
     /// move and insert, as in the popup.
     list_focus: FocusHandle,
+    /// The command line and settings file this process started with.
+    args: Args,
 }
 
 /// The popup after a right click, Ctrl+E or Ctrl+N: it takes focus and shows
@@ -488,6 +493,9 @@ struct Popup {
 struct EditSession {
     /// The form and its subscription. `None` in the list-only mode.
     form: Option<(Entity<editor::EditorView>, Subscription)>,
+    /// The settings panel, which shows in place of the form. At most one
+    /// of `form` and `settings` is set.
+    settings: Option<(Entity<settings_view::SettingsView>, Subscription)>,
     /// Where the popup was. The window's top left corner stays there.
     near: Rect,
     /// The window that had focus before. It gets focus back when the edit
@@ -587,6 +595,7 @@ impl Popup {
             pick: None,
             edit: None,
             list_focus: cx.focus_handle(),
+            args: args.clone(),
         }
     }
 
@@ -598,6 +607,7 @@ impl Popup {
             let prev = focus::foreground().filter(|h| !focus::is_own(*h));
             self.edit = Some(EditSession {
                 form: None,
+                settings: None,
                 near,
                 prev,
                 was_active: false,
@@ -640,8 +650,10 @@ impl Popup {
             editor::EditorEvent::Close => this.hide_form(window, cx),
             editor::EditorEvent::Done => this.end_edit(true, None, cx),
             editor::EditorEvent::FocusList => this.focus_list(window, cx),
+            editor::EditorEvent::Settings => this.mount_settings(window, cx),
         });
         if let Some(edit) = &mut self.edit {
+            edit.settings = None;
             edit.form = Some((view, sub));
             edit.form_gen += 1;
         }
@@ -673,9 +685,10 @@ impl Popup {
     /// popup was, and the form to its right, if it shows.
     fn place_edit(&mut self) {
         let Some(edit) = &self.edit else { return };
-        let r = match edit.form {
-            Some(_) => rect_at(edit.near, WIDTH + FORM_W, EDIT_H),
-            None => rect_at(edit.near, WIDTH, self.height()),
+        let r = if edit.form.is_some() || edit.settings.is_some() {
+            rect_at(edit.near, WIDTH + FORM_W, EDIT_H)
+        } else {
+            rect_at(edit.near, WIDTH, self.height())
         };
         if self.shown != Some(r) {
             self.shown = Some(r);
@@ -881,6 +894,7 @@ impl Popup {
             self.refresh(cx);
             self.edit = Some(EditSession {
                 form: None,
+                settings: None,
                 near,
                 prev: None,
                 was_active: false,
@@ -948,6 +962,10 @@ impl Popup {
                 r
             }
             tray::Action::RestartAsAdmin => tray::restart_as_admin(),
+            tray::Action::Settings => {
+                self.settings_from_tray(window, cx);
+                Ok(())
+            }
             tray::Action::Quit => {
                 cx.quit();
                 Ok(())
@@ -956,6 +974,119 @@ impl Popup {
         if let Err(e) = result {
             popup_core::log::line(&format!("tray: {action:?} failed: {e}"));
         }
+        if matches!(action, tray::Action::Pause(_) | tray::Action::StartAtSignIn(_)) {
+            self.update_settings_status(cx);
+        }
+    }
+
+    /// The Settings button under the list: the settings panel takes the
+    /// place of the form. An open form with unsaved edits asks first.
+    fn show_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.edit.is_none() {
+            return;
+        }
+        match self.form_view() {
+            // The editor sends `EditorEvent::Settings` once the unsaved
+            // edits are saved or discarded, or at once without any.
+            Some(view) => view.update(cx, |v, cx| v.request(editor::Request::Settings, window, cx)),
+            None => self.mount_settings(window, cx),
+        }
+    }
+
+    /// Shows the settings panel in the right half, in place of the form.
+    fn mount_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(edit) = &self.edit else { return };
+        if let Some((view, _)) = &edit.settings {
+            let focus = view.read(cx).focus.clone();
+            window.focus(&focus, cx);
+            return;
+        }
+        let (running, fixed, status) =
+            (settings_view::running_settings(&self.args), self.args.from_cli.clone(), self.settings_status());
+        let view = cx.new(|cx| settings_view::SettingsView::new(running, fixed, status, window, cx));
+        let sub = cx.subscribe_in(&view, window, |this, _, ev: &settings_view::SettingsEvent, window, cx| {
+            this.settings_event(*ev, window, cx)
+        });
+        let focus = view.read(cx).focus.clone();
+        if let Some(edit) = &mut self.edit {
+            edit.form = None;
+            edit.settings = Some((view, sub));
+            edit.form_gen += 1;
+        }
+        popup_core::log::line("ui edit session: settings");
+        self.place_edit();
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    /// Esc or Close in the settings panel: the popup shows only its list.
+    fn hide_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(edit) = &mut self.edit else { return };
+        edit.settings = None;
+        popup_core::log::line("ui edit session: list only");
+        self.place_edit();
+        self.focus_list(window, cx);
+    }
+
+    /// "Settings..." in the tray: the edit session opens, as for Edit
+    /// snippets, and shows the settings panel.
+    fn settings_from_tray(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.edit.is_none() {
+            self.edit_from_tray(None, window, cx);
+        }
+        // The window comes to the front again, also when the session was
+        // already open behind another window.
+        self.shown = None;
+        self.show_settings(window, cx);
+        self.place_edit();
+    }
+
+    fn settings_status(&self) -> settings_view::Status {
+        settings_view::Status {
+            paused: self.shared.is_paused(),
+            sign_in: tray::start_at_sign_in(),
+            admin: focus::is_elevated(),
+            can_restart_as_admin: tray::can_restart_as_admin(),
+        }
+    }
+
+    fn update_settings_status(&self, cx: &mut Context<Self>) {
+        if let Some((view, _)) = self.edit.as_ref().and_then(|e| e.settings.as_ref()) {
+            let status = self.settings_status();
+            view.update(cx, |v, cx| v.set_status(status, cx));
+        }
+    }
+
+    fn settings_event(&mut self, ev: settings_view::SettingsEvent, window: &mut Window, cx: &mut Context<Self>) {
+        use settings_view::SettingsEvent as E;
+        let action = match ev {
+            E::Pause(on) => {
+                if let Some(t) = &self.tray {
+                    t.set_pause_checked(on);
+                }
+                tray::Action::Pause(on)
+            }
+            E::SignIn(on) => {
+                if let Some(t) = &self.tray {
+                    t.set_sign_in_checked(on);
+                }
+                tray::Action::StartAtSignIn(on)
+            }
+            E::RestartAsAdmin => tray::Action::RestartAsAdmin,
+            E::OpenLog => tray::Action::OpenLog,
+            E::Close => {
+                self.hide_settings(window, cx);
+                return;
+            }
+            E::Restart => {
+                match tray::restart() {
+                    Ok(()) => cx.quit(),
+                    Err(e) => popup_core::log::line(&format!("settings: cannot restart: {e}")),
+                }
+                return;
+            }
+        };
+        self.tray_action(action, window, cx);
     }
 
     fn show_status(&mut self) {
@@ -1238,7 +1369,7 @@ impl Popup {
     fn esc_hint(&self) -> &'static str {
         match &self.edit {
             Some(e) if e.files.is_some() => "Esc: back to snippets",
-            Some(e) if e.form.is_some() => "Esc: list only",
+            Some(e) if e.form.is_some() || e.settings.is_some() => "Esc: list only",
             Some(_) => "Esc: close",
             None => "",
         }
@@ -1610,6 +1741,15 @@ impl Render for Popup {
             .mx(px(PAD))
             .text_xs()
             .text_color(theme.muted_foreground)
+            .child(
+                Button::new("open-settings")
+                    .icon(IconName::Settings)
+                    .label("Settings")
+                    .ghost()
+                    .xsmall()
+                    .selected(edit.settings.is_some())
+                    .on_click(cx.listener(|this, _, window, cx| this.show_settings(window, cx))),
+            )
             .child(div().flex_1().min_w_0().truncate().child(match &edit.files {
                 Some(pick) => SharedString::from(pick.query.clone()),
                 None => status.unwrap_or_default(),
@@ -1665,13 +1805,18 @@ impl Render for Popup {
                         }
                     }
                 }));
-        match &edit.form {
+        let side: Option<AnyView> = match (&edit.form, &edit.settings) {
+            (Some((view, _)), _) => Some(view.clone().into()),
+            (None, Some((view, _))) => Some(view.clone().into()),
+            (None, None) => None,
+        };
+        match side {
             None => root.child(list.size_full()),
             // The list keeps its width on the left, and the form fills the
             // rest. The form fades in and slides in a little from the list,
             // so the eye sees where it came from. The window itself does not
             // animate: a stepped resize flickers.
-            Some((view, _)) => root
+            Some(view) => root
                 .child(
                     list.w(px(WIDTH))
                         .flex_none()
@@ -1685,7 +1830,7 @@ impl Render for Popup {
                         .min_w_0()
                         .h_full()
                         .relative()
-                        .child(view.clone())
+                        .child(view)
                         .with_animation(
                             ("form-in", edit.form_gen),
                             Animation::new(FORM_IN).with_easing(ease_out_quint()),
@@ -1771,7 +1916,7 @@ fn kind(ev: &HookEvent) -> &'static str {
 
 fn main() {
     popup_core::init_dpi();
-    let args = Args::parse();
+    let args = Args::parse_with(&popup_core::settings::Settings::load());
     timing::enable(args.timing);
     if let Some(path) = &args.log {
         if let Err(e) = popup_core::log::open(path) {

@@ -7,8 +7,11 @@ description = "Shared logic for the caret popup prototypes: caret lookup, placem
 
 [dependencies]
 anyhow.workspace = true
+dirs.workspace = true
+serde.workspace = true
 serde_norway.workspace = true
 snip-core.workspace = true
+toml = "0.8"
 espanso-config.workspace = true
 espanso-match.workspace = true
 espanso-render.workspace = true

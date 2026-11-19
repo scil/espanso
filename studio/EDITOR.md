@@ -105,6 +105,7 @@ Menu:
 | Open configuration folder | Opens the espanso base folder in Explorer. |
 | Open log | Opens the log file in the default text editor. |
 | Start at sign-in | A check item. It adds or removes `snip.exe` under the `Run` key of `HKCU`, and an "enabled" entry for it under `Explorer\StartupApproved\Run`. Recent Windows 11 builds skip a `Run` value that has no such entry. If both exist and the entry says enabled, the item is checked. Otherwise it is clear, for example after a switch-off in Task Manager. |
+| Settings... | Opens the edit session with the settings panel in the right half. See [Settings panel](POPUP.md#settings-panel). |
 | Restart as administrator | It runs `scripts/win/snip.ps1 -Action start`. The menu hides this item while `snip` has administrator rights. |
 | Quit | Ends the process. |
 

@@ -188,6 +188,21 @@ Both modes use the same rules. A UTF-16 unit is one character, or half of an emo
 | `--prefix-wait-ms N` | A typed trigger that is also the start of a longer trigger waits for the next key. Space, Tab or Enter expands it, and that key is not typed. With N above 0, the short trigger also expands after N ms without a key. The default is 0: no time limit. While the popup is open, the wait never has a time limit. See `EXPANDER.md`. |
 | `--tab accept\|move\|ignore` | What Tab does while the popup is open. `accept` (default) inserts the selected row, as Enter does, and Shift+Tab does the same. `move` selects the next row, and Shift+Tab selects the previous row. `ignore` leaves Tab to the application, and the popup closes. A pick list follows the same setting. |
 
+### Settings panel
+
+`snip` reads `%LOCALAPPDATA%\snip\settings.toml` at the start. Each key has the name of a flag above, plus `trigger` and `log`. For example, `tab = "move"` does what `--tab move` does. A flag on the command line wins over the file. A missing file or key gives the default. `log = true` writes `events.log` in the same folder.
+
+The edit session shows the settings in its right half, in place of the edit form. The Settings button at the left end of the status line under the list opens them, and so does "Settings..." in the tray menu. If the form has unsaved changes, its Save / Discard bar asks first. A click on a snippet brings the form back. Esc or Close shows only the list. The panel has four groups:
+
+| Group | Settings |
+| --- | --- |
+| Popup | Trigger, Tab key. |
+| Insert | Long text (paste or type), short text limit, characters per call, gap between calls. |
+| Prefix trigger | Wait time. |
+| Startup and rights | Start at sign-in, Pause expansion, Restart as administrator, Log. |
+
+"Save and restart snip" writes the file and starts snip again with the same command line, because the hook and the engine read the settings only at the start. The new process has the rights of the old one, so an administrator snip restarts without a consent prompt. A setting that a command line flag sets shows its value as text, not as a box. Start at sign-in, Pause expansion, Restart as administrator and Open log act at once, as the tray items do.
+
 A paste does not leave the snippet in the clipboard history:
 
 1. The popup saves the clipboard text.
