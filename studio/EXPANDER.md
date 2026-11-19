@@ -147,3 +147,44 @@ Limits:
 - A form with more than one field still opens the form window. Its `choice` and `list` fields keep their own list in that window.
 
 Tests on 2026-11-16: unit tests for the hook's pick mode and for the engine. Not tested by hand yet, because the running `snip` (with administrator rights) holds `target/release/snip.exe`.
+
+## Paragraph picks
+
+Added on 2026-11-18. A paragraph pick (a term of this project, no industry term) is a snippet whose paragraphs you check in a list. Only the checked paragraphs are inserted. One key under `snip:` turns it on:
+
+```yaml
+- trigger: ";;reply"
+  snip: { pick: many }
+  replace: |
+    Hello,
+
+    Thank you for your message.
+
+    I will look into it today.
+
+    Best regards
+```
+
+Rules:
+
+- A blank line separates paragraphs. A line with only spaces counts as blank. Lines inside a paragraph keep their indentation.
+- The checked paragraphs keep their order in the text, not the order in which you checked them. One blank line joins them. The line break at the end of a YAML `|` block stays.
+- All paragraphs start checked. `snip: { pick: many, checked: none }` starts with none checked.
+- A snippet with only one paragraph inserts without a list.
+- espanso ignores the `snip:` key and inserts the whole text. A bad value, for example `pick: one`, gives a `warning` in the log and in `snipctl validate`, and the snippet expands without a list.
+
+The list:
+
+- It is the pick list of the popup with a check box on each row. The row shows the first line of the paragraph. A badge, for example `+2 lines`, tells that the paragraph has more lines.
+- Keys: Space checks or unchecks the selected row. Ctrl+1 to Ctrl+9 check or uncheck the row with that number. Ctrl+A checks all shown rows, or unchecks them if all are checked. A click on a row checks or unchecks it. Other typed characters filter the list. Enter inserts the checked paragraphs. If none is checked, Enter inserts the selected row. Esc cancels and leaves the trigger in the text.
+- The status line shows the filter, the number of checked paragraphs and the keys.
+
+How it works:
+
+- `snip_core::pieces` reads the `snip:` key, splits the text and joins the checked paragraphs. `Origins::load` reads the key in the same pass that finds the file of each match, into `Origins::picks`.
+- The engine asks before it renders (`Ask::pick_many`). Then it renders only the checked paragraphs. The default `Ask::pick_many` cancels, so a front end without this list inserts nothing.
+- espanso's renderer runs every local variable of a match, also a variable that the body does not use. So the engine first removes each variable that no checked paragraph uses, directly or through another variable (`depends_on`, or a `{{name}}` in its parameters). A form or a shell command in an unchecked paragraph does not run.
+- No upstream crate changed. The new code is in `snip-core/src/pieces.rs`, `popup-core` and the `snip` binary.
+- The hook counts pick lists. A list that follows another one with no key between them, for example a paragraph list after a tie list, starts with an empty filter. Before this change, it kept the filter of the first list.
+
+Tests on 2026-11-18: unit tests for the split, the join, the `snip:` key, the variable names, the engine (checked paragraphs, a variable of an unchecked paragraph that would fail, a variable that a used variable needs, cancel) and the hook keys. Not tested by hand yet.

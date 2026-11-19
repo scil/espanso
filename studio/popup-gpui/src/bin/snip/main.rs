@@ -271,15 +271,31 @@ impl Ask for UiAsk {
     }
 
     fn pick(&self, items: Vec<PickItem>) -> Option<usize> {
+        self.show_pick(items, None)?.first().copied()
+    }
+
+    fn pick_many(&self, items: Vec<PickItem>, checked: Vec<bool>) -> Option<Vec<usize>> {
+        self.show_pick(items, Some(checked))
+    }
+}
+
+impl UiAsk {
+    /// Shows a pick list in the popup and waits for the picked indexes.
+    /// `checked` gives the list check boxes and their start state.
+    fn show_pick(&self, items: Vec<PickItem>, checked: Option<Vec<bool>>) -> Option<Vec<usize>> {
         // From here on the hook swallows typed keys, so the trigger stays
         // as typed. It replaces an open `;;` session.
-        self.shared.start_pick();
+        if checked.is_some() {
+            self.shared.start_pick_many();
+        } else {
+            self.shared.start_pick();
+        }
         // Give the application a moment to draw the last trigger character.
         std::thread::sleep(Duration::from_millis(10));
         let caret = caret::locate(Duration::from_millis(150));
         let (reply, answer) = mpsc::channel();
-        popup_core::log::line(&format!("pick: open, {} items", items.len()));
-        if self.ui.send(Ui::Pick { items, caret, reply }).is_err() {
+        popup_core::log::line(&format!("pick: open, {} items, check boxes {}", items.len(), checked.is_some()));
+        if self.ui.send(Ui::Pick { items, checked, caret, reply }).is_err() {
             self.shared.deactivate();
             return None;
         }
@@ -316,8 +332,9 @@ enum Ui {
     Hook(HookEvent),
     /// Show a form near the caret and send the answer on `reply`.
     Form { form: Form, caret: Caret, reply: form_view::Reply },
-    /// Show a pick list in the popup and send the picked index on `reply`.
-    Pick { items: Vec<PickItem>, caret: Caret, reply: Sender<Option<usize>> },
+    /// Show a pick list in the popup and send the picked indexes on
+    /// `reply`. `checked` gives the list check boxes.
+    Pick { items: Vec<PickItem>, checked: Option<Vec<bool>>, caret: Caret, reply: Sender<Option<Vec<usize>>> },
     /// The espanso configuration folder.
     Base(PathBuf),
     /// A load ended: the number of snippets, or the error.
@@ -467,13 +484,15 @@ struct EditSession {
 /// A pick list from the expander: the items and where the answer goes.
 struct Pick {
     items: Vec<PickItem>,
-    reply: Sender<Option<usize>>,
+    /// The state of each check box, if the list has them.
+    checked: Option<Vec<bool>>,
+    reply: Sender<Option<Vec<usize>>>,
 }
 
 impl Pick {
-    fn answer(self, index: Option<usize>) {
-        popup_core::log::line(&format!("ui pick: {index:?}"));
-        let _ = self.reply.send(index);
+    fn answer(self, indexes: Option<Vec<usize>>) {
+        popup_core::log::line(&format!("ui pick: {indexes:?}"));
+        let _ = self.reply.send(indexes);
     }
 }
 
@@ -891,7 +910,7 @@ impl Popup {
                 self.place_and_show();
                 window.on_next_frame(move |_, _| timing::since("open-to-frame", pressed));
             }
-            Ui::Pick { items, caret, reply } => {
+            Ui::Pick { items, checked, caret, reply } => {
                 if let Some(old) = self.pick.take() {
                     old.answer(None);
                 }
@@ -901,7 +920,7 @@ impl Popup {
                     return;
                 }
                 self.end_edit(false, None, cx);
-                self.pick = Some(Pick { items, reply });
+                self.pick = Some(Pick { items, checked, reply });
                 self.open = true;
                 self.caret = Some(caret);
                 self.keyword.clear();
@@ -954,9 +973,17 @@ impl Popup {
                     }
                 }
             },
+            Ui::Hook(HookEvent::Toggle(row)) => self.toggle(row.unwrap_or(self.selected), cx),
+            Ui::Hook(HookEvent::ToggleAll) => self.toggle_all(cx),
+            // A click on a row with a check box checks it; Enter inserts.
             Ui::Hook(HookEvent::Click) => {
                 if let Some(row) = self.hovered {
-                    self.accept(row, cx);
+                    if self.pick.as_ref().is_some_and(|p| p.checked.is_some()) {
+                        self.selected = row;
+                        self.toggle(row, cx);
+                    } else {
+                        self.accept(row, cx);
+                    }
                 }
             }
             // A right click edits the row under the mouse. A pick list has
@@ -1023,6 +1050,11 @@ impl Popup {
         let filter = if self.pick.is_some() || self.edit.is_some() { self.keyword.as_str() } else { "" };
         if let Some(n) = &self.note {
             Some(n.clone())
+        } else if let Some(c) = self.pick.as_ref().and_then(|p| p.checked.as_ref()) {
+            // A list with check boxes always shows its keys and count.
+            let n = c.iter().filter(|&&on| on).count();
+            let shown = if self.results.is_empty() { "no match   " } else { "" };
+            Some(format!("{filter}   {shown}{n} of {} checked · Space checks · Enter inserts", c.len()).trim_start().to_string().into())
         } else if self.pick.is_none() && self.snap.is_none() {
             Some("Loading snippets…".into())
         } else if self.results.is_empty() {
@@ -1095,11 +1127,40 @@ impl Popup {
         let _ = self.engine.send(ToEngine::Editor { erase, request });
     }
 
+    /// Checks or unchecks the item of a shown row in a list with check
+    /// boxes.
+    fn toggle(&mut self, row: usize, cx: &mut Context<Self>) {
+        let Some(&index) = self.results.get(row) else { return };
+        if let Some(checked) = self.pick.as_mut().and_then(|p| p.checked.as_mut()) {
+            checked[index] = !checked[index];
+            cx.notify();
+        }
+    }
+
+    /// Checks every shown row, or unchecks them if all are checked.
+    fn toggle_all(&mut self, cx: &mut Context<Self>) {
+        let Some(checked) = self.pick.as_mut().and_then(|p| p.checked.as_mut()) else { return };
+        let all = self.results.iter().all(|&i| checked[i]);
+        for &i in &self.results {
+            checked[i] = !all;
+        }
+        cx.notify();
+    }
+
     fn accept(&mut self, row: usize, cx: &mut Context<Self>) {
-        if self.pick.is_some() {
-            let Some(&index) = self.results.get(row) else { return };
+        if let Some(pick) = &self.pick {
+            // With check boxes, the checked items go back. With none
+            // checked, the selected row does.
+            let shown = self.results.get(row).copied();
+            let chosen: Vec<usize> = match &pick.checked {
+                Some(c) if c.contains(&true) => (0..c.len()).filter(|&i| c[i]).collect(),
+                _ => shown.into_iter().collect(),
+            };
+            if chosen.is_empty() {
+                return;
+            }
             if let Some(pick) = self.pick.take() {
-                pick.answer(Some(index));
+                pick.answer(Some(chosen));
             }
             // The engine thread ends the hook session after the answer.
             self.hide();
@@ -1159,12 +1220,18 @@ impl Render for Popup {
                 .collect(),
         };
         let count = lines.len();
+        // The check box of each row, in a list that has them.
+        let checks: Vec<Option<bool>> = match self.pick.as_ref().and_then(|p| p.checked.as_ref()) {
+            Some(c) => self.results.iter().map(|&i| Some(c[i])).collect(),
+            None => vec![None; count],
+        };
         let editing = self.edit.is_some();
         let rows = lines.into_iter().enumerate().map(|(row, (title, badge, exact))| {
             // Rows 1 to 9 have a number for Ctrl+1 to Ctrl+9.
             let number = if row < 9 { (row + 1).to_string() } else { String::new() };
             let selected = row == self.selected;
             let is_exact = exact.is_some();
+            let check = checks.get(row).copied().flatten();
             div()
                     .id(row)
                     .flex()
@@ -1220,6 +1287,18 @@ impl Render for Popup {
                             .text_color(theme.muted_foreground)
                             .child(number),
                     )
+                    // A check box: a frame, filled when checked.
+                    .when_some(check, |d, on| {
+                        d.child(
+                            div()
+                                .size(px(12.0))
+                                .flex_none()
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(if on { theme.primary } else { theme.muted_foreground })
+                                .when(on, |d| d.bg(theme.primary)),
+                        )
+                    })
                     .child(
                         div()
                             .flex_1()
@@ -1361,6 +1440,8 @@ fn kind(ev: &HookEvent) -> &'static str {
         HookEvent::AcceptRow(_) => "accept row",
         HookEvent::Edit => "edit",
         HookEvent::New { .. } => "new",
+        HookEvent::Toggle(_) => "toggle",
+        HookEvent::ToggleAll => "toggle all",
         HookEvent::Cancel => "cancel",
     }
 }

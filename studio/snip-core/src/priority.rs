@@ -39,6 +39,7 @@ use serde::Serialize;
 use serde_norway::Value;
 
 use crate::error::Problem;
+use crate::pieces::{self, Pick};
 
 pub const PERSONAL: i32 = 0;
 pub const NORMAL: i32 = 16;
@@ -58,7 +59,9 @@ pub struct Origin {
 #[derive(Debug, Default)]
 pub struct Origins {
     pub by_id: HashMap<i32, Origin>,
-    /// Priority values that do not parse.
+    /// Matches with `snip.pick`, by match id. See [`crate::pieces`].
+    pub picks: HashMap<i32, Pick>,
+    /// Priority values that do not parse, and bad `snip.pick` keys.
     pub problems: Vec<Problem>,
 }
 
@@ -116,6 +119,17 @@ impl Origins {
                 let index = (next..items.len()).find(|&j| item_key(&items[j]) == key);
                 if let Some(j) = index {
                     next = j + 1;
+                    match pieces::read(&items[j]) {
+                        Ok(Some(pick)) => {
+                            origins.picks.insert(m.id, pick);
+                        }
+                        Ok(None) => {}
+                        Err(e) => origins.problems.push(Problem {
+                            file: rel.clone(),
+                            level: "warning".into(),
+                            message: format!("match {}: {e}", j + 1),
+                        }),
+                    }
                 }
                 origins.by_id.insert(m.id, Origin { file: rel.clone(), index, priority: file_priority });
             }

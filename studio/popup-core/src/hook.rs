@@ -92,6 +92,12 @@ pub enum HookEvent {
     /// Ctrl+N: create a snippet. The hook stays active until the UI calls
     /// [`Shared::deactivate`].
     New { keyword: String },
+    /// In a list with check boxes: Space (`None`, the selected row) or
+    /// Ctrl+1 to Ctrl+9 (that row, 0-based) checks or unchecks a row.
+    Toggle(Option<usize>),
+    /// In a list with check boxes: Ctrl+A checks every shown row, or
+    /// unchecks them if all are checked.
+    ToggleAll,
     /// The popup must close.
     Cancel,
 }
@@ -102,6 +108,11 @@ pub struct Shared {
     active: AtomicBool,
     /// The session is a pick list from the expander, not a `;;` search.
     pick: AtomicBool,
+    /// The pick list has check boxes.
+    many: AtomicBool,
+    /// Counts pick lists, so that a list that follows another one with no
+    /// key between them starts with an empty filter.
+    picks: AtomicUsize,
     paused: AtomicBool,
     results: AtomicUsize,
     popup: Mutex<Option<Rect>>,
@@ -132,14 +143,23 @@ impl Shared {
     /// trigger.
     pub fn deactivate(&self) {
         self.pick.store(false, Ordering::Relaxed);
+        self.many.store(false, Ordering::Relaxed);
         self.active.store(false, Ordering::Relaxed);
         self.set_popup_rect(None);
     }
     /// Starts a pick-list session. It replaces an open `;;` session.
     pub fn start_pick(&self) {
         self.set_results(0);
+        self.many.store(false, Ordering::Relaxed);
+        self.picks.fetch_add(1, Ordering::Relaxed);
         self.pick.store(true, Ordering::Relaxed);
         self.active.store(true, Ordering::Relaxed);
+    }
+    /// Starts a pick list with check boxes. Space and Ctrl+1 to Ctrl+9
+    /// check rows, Ctrl+A checks all, Enter accepts the checked rows.
+    pub fn start_pick_many(&self) {
+        self.start_pick();
+        self.many.store(true, Ordering::Relaxed);
     }
     /// Whether the session is a pick list.
     pub fn is_picking(&self) -> bool {
@@ -249,6 +269,8 @@ pub struct Machine {
     last: String,
     /// The machine handles a pick-list session.
     in_pick: bool,
+    /// The pick list that the machine handles, by [`Shared`]'s count.
+    pick_seen: usize,
     shared: Arc<Shared>,
     tx: Sender<(Instant, HookEvent)>,
     on_input: Option<OnInput>,
@@ -275,6 +297,7 @@ impl Machine {
             keyword: String::new(),
             last: String::new(),
             in_pick: false,
+            pick_seen: 0,
             shared,
             tx,
             on_input,
@@ -345,8 +368,10 @@ impl Machine {
 
     fn popup_key(&mut self, key: Key) -> Verdict {
         if self.shared.is_picking() {
-            if !self.in_pick {
+            let pick = self.shared.picks.load(Ordering::Relaxed);
+            if !self.in_pick || self.pick_seen != pick {
                 self.in_pick = true;
+                self.pick_seen = pick;
                 self.active = false;
                 self.keyword.clear();
                 self.recent.clear();
@@ -498,7 +523,30 @@ impl Machine {
     /// A key in a pick-list session. Typing filters the list but never
     /// reaches the application.
     fn pick_key(&mut self, key: Key) -> Verdict {
+        let many = self.shared.many.load(Ordering::Relaxed);
+        let results = self.shared.results.load(Ordering::Relaxed);
         match self.tab_as(key) {
+            Key::Char(' ') if many => {
+                if results > 0 {
+                    self.emit(HookEvent::Toggle(None));
+                }
+                Verdict::Swallow
+            }
+            Key::CtrlDigit(n) if many && usize::from(n.max(1)) <= results => {
+                self.emit(HookEvent::Toggle(Some(usize::from(n.max(1)) - 1)));
+                Verdict::Swallow
+            }
+            Key::CtrlLetter('a') if many => {
+                self.emit(HookEvent::ToggleAll);
+                Verdict::Swallow
+            }
+            // Checked rows can be hidden by the filter, so Enter accepts
+            // with no shown row too.
+            Key::Enter if many => {
+                crate::log::line("hook pick accept checked rows");
+                self.emit(HookEvent::Accept { keyword: self.keyword.clone() });
+                Verdict::Swallow
+            }
             Key::Char(c) => {
                 self.keyword.push(c);
                 self.emit(HookEvent::Query(self.keyword.clone()));
@@ -908,6 +956,37 @@ mod tests {
         shared.deactivate();
         typed(&mut m, "//");
         assert_eq!(events(&rx), vec![HookEvent::Open]);
+    }
+
+    #[test]
+    fn check_box_list_toggles_rows() {
+        let (mut m, rx, shared) = machine();
+        shared.start_pick_many();
+        // No rows yet: Space does nothing.
+        assert_eq!(m.key(Key::Char(' ')), Verdict::Swallow);
+        shared.set_results(3);
+        assert_eq!(m.key(Key::Char(' ')), Verdict::Swallow);
+        assert_eq!(m.key(Key::CtrlDigit(3)), Verdict::Swallow);
+        assert_eq!(m.key(Key::CtrlLetter('a')), Verdict::Swallow);
+        assert_eq!(m.key(Key::Char('x')), Verdict::Swallow);
+        // Enter accepts even when the filter shows no row.
+        shared.set_results(0);
+        assert_eq!(m.key(Key::Enter), Verdict::Swallow);
+        assert_eq!(
+            events(&rx),
+            vec![
+                HookEvent::Toggle(None),
+                HookEvent::Toggle(Some(2)),
+                HookEvent::ToggleAll,
+                HookEvent::Query("x".into()),
+                HookEvent::Accept { keyword: "x".into() },
+            ]
+        );
+        // A plain pick list after it has no check boxes: Space filters.
+        shared.deactivate();
+        shared.start_pick();
+        assert_eq!(m.key(Key::Char(' ')), Verdict::Swallow);
+        assert_eq!(events(&rx), vec![HookEvent::Query(" ".into())]);
     }
 
     #[test]

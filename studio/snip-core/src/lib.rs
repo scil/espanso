@@ -10,9 +10,12 @@
 //!   matches share a trigger.
 //! - [`matchedit`] reads one match into form fields and writes a form
 //!   change back as the smallest text change.
+//! - [`pieces`] splits a match into paragraphs that the user checks in a
+//!   list (`snip: { pick: many }`).
 
 pub mod error;
 pub mod matchedit;
+pub mod pieces;
 pub mod portability;
 pub mod priority;
 pub mod rpc;

@@ -40,6 +40,7 @@ use espanso_render::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
+use snip_core::pieces::{self, Pick};
 use snip_core::priority::{self, Origins};
 
 use crate::data::Entry;
@@ -59,6 +60,15 @@ pub trait Ask {
         let mut answer = self.ask(Form::choice(titles.clone()))?;
         let title = answer.remove(crate::form::CHOICE_FIELD)?;
         titles.iter().position(|t| *t == title)
+    }
+
+    /// Shows a list with check boxes and returns the indexes of the checked
+    /// items, or `None` if the user canceled. `checked` holds the start
+    /// state of each item. The default cancels, for callers without such a
+    /// list.
+    fn pick_many(&self, items: Vec<PickItem>, checked: Vec<bool>) -> Option<Vec<usize>> {
+        let _ = (items, checked);
+        None
     }
 }
 
@@ -587,6 +597,12 @@ impl Engine {
     ) -> Result<String> {
         let template =
             self.templates.get(&m.id).ok_or_else(|| anyhow!("only text snippets can expand"))?;
+        // The user checks paragraphs first. Only the checked ones render, so
+        // a variable that only an unchecked paragraph uses does not run.
+        let picked = match self.origins.picks.get(&m.id) {
+            Some(pick) => Some(self.pick_pieces(&template.body, *pick)?),
+            None => None,
+        };
         let (templates, global_vars) = (self.templates, self.global_vars);
         let context = self
             .contexts
@@ -594,10 +610,14 @@ impl Engine {
             .or_insert_with(|| context_for(set, templates, global_vars));
         let options = RenderOptions { casing_style: casing_of(m, trigger) };
         let mut augmented;
-        let template = if trigger_vars.is_empty() {
+        let template = if trigger_vars.is_empty() && picked.is_none() {
             template
         } else {
             augmented = template.clone();
+            if let Some(body) = picked {
+                augmented.body = body;
+                keep_used_vars(&mut augmented);
+            }
             for (name, value) in trigger_vars {
                 let mut params = Params::new();
                 params.insert("echo".to_string(), Value::String(value));
@@ -622,6 +642,34 @@ impl Engine {
             RenderResult::Success(body) => Ok(body),
             RenderResult::Aborted => Err(anyhow!("aborted")),
             RenderResult::Error(e) => Err(e),
+        }
+    }
+
+    /// Asks which paragraphs of `body` to keep and returns the new body. A
+    /// body with one paragraph needs no list.
+    fn pick_pieces(&self, body: &str, pick: Pick) -> Result<String> {
+        let pieces = pieces::split(body);
+        if pieces.parts.len() < 2 {
+            return Ok(body.to_string());
+        }
+        let items = pieces
+            .parts
+            .iter()
+            .map(|p| {
+                let mut lines = p.lines();
+                let first = lines.next().unwrap_or_default();
+                let more = lines.count();
+                PickItem {
+                    title: one_line(first, 120),
+                    detail: p.clone(),
+                    badge: if more > 0 { format!("+{more} lines") } else { String::new() },
+                }
+            })
+            .collect();
+        let checked = vec![pick.all_checked; pieces.parts.len()];
+        match self.forms.ask.pick_many(items, checked) {
+            Some(chosen) if !chosen.is_empty() => Ok(pieces::join(&pieces, &chosen)),
+            _ => Err(anyhow!("aborted")),
         }
     }
 
@@ -683,6 +731,40 @@ fn choice_labels<'a>(matches: impl Iterator<Item = Option<&'a Match>>) -> Vec<St
         out.push(label);
     }
     out
+}
+
+/// Removes the local variables that the body does not use, directly or
+/// through another variable. espanso runs every local variable, so without
+/// this a form or a shell command of an unchecked paragraph would run.
+fn keep_used_vars(template: &mut Template) {
+    fn param_texts<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
+        match value {
+            Value::String(s) => out.push(s),
+            Value::Array(a) => a.iter().for_each(|v| param_texts(v, out)),
+            Value::Object(o) => o.values().for_each(|v| param_texts(v, out)),
+            _ => {}
+        }
+    }
+    let mut used: HashSet<String> = pieces::var_names(&template.body).into_iter().map(str::to_string).collect();
+    // A variable that a used variable needs is used too. Repeat until no
+    // name is added.
+    loop {
+        let before = used.len();
+        let mut needs: Vec<String> = Vec::new();
+        for var in template.vars.iter().filter(|v| used.contains(&v.name)) {
+            needs.extend(var.depends_on.iter().cloned());
+            if var.inject_vars {
+                let mut texts = Vec::new();
+                var.params.values().for_each(|v| param_texts(v, &mut texts));
+                needs.extend(texts.iter().flat_map(|t| pieces::var_names(t)).map(str::to_string));
+            }
+        }
+        used.extend(needs);
+        if used.len() == before {
+            break;
+        }
+    }
+    template.vars.retain(|v| used.contains(&v.name));
 }
 
 /// Text on one line: line breaks become spaces, runs of spaces shrink, and
@@ -1144,6 +1226,104 @@ matches:
         let entry = e.entries().into_iter().find(|x| x.trigger == ":cur").unwrap();
         let x = e.render_by_id(entry.id, &App::default()).unwrap();
         assert_eq!((x.text.as_str(), x.lefts), ("abc", 2));
+    }
+
+    /// The lists that [`Check`] saw, with their start states.
+    type Seen = std::sync::Arc<Mutex<Vec<(Vec<PickItem>, Vec<bool>)>>>;
+
+    /// Checks fixed paragraphs and records the lists.
+    struct Check(Vec<usize>, Seen);
+
+    impl Ask for Check {
+        fn ask(&self, _: Form) -> Option<HashMap<String, String>> {
+            None
+        }
+        fn pick_many(&self, items: Vec<PickItem>, checked: Vec<bool>) -> Option<Vec<usize>> {
+            self.1.lock().unwrap().push((items, checked));
+            Some(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn paragraph_pick_inserts_the_checked_paragraphs() {
+        let base = r#"
+matches:
+  - trigger: ":rep"
+    snip: { pick: many, checked: none }
+    replace: |
+      Hello,
+
+      Line one
+      line two
+
+      Today is {{year}}.
+
+      Bye {{who}}
+    vars:
+      - name: year
+        type: date
+        params: { format: "%Y" }
+      - name: who
+        type: shell
+        params: { cmd: "exit 1" }
+  - trigger: ":one"
+    snip: { pick: many }
+    replace: "only one"
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("config")).unwrap();
+        std::fs::create_dir_all(dir.path().join("match")).unwrap();
+        std::fs::write(dir.path().join("config/default.yml"), "").unwrap();
+        std::fs::write(dir.path().join("match/base.yml"), base).unwrap();
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let mut e = Engine::load_with(dir.path(), Box::new(Check(vec![2, 0], seen.clone()))).unwrap();
+        // The variable of the unchecked last paragraph does not run: its
+        // failing shell command would abort the render.
+        let x = typed(&mut e, ":rep").unwrap();
+        let year = x.text.lines().nth(2).unwrap().to_string();
+        assert!(year.starts_with("Today is 20"), "{}", x.text);
+        assert_eq!(x.text, format!("Hello,\n\n{year}\n"));
+        assert_eq!(x.erase, 4);
+        {
+            let seen = seen.lock().unwrap();
+            let (items, checked) = &seen[0];
+            let titles: Vec<&str> = items.iter().map(|i| i.title.as_str()).collect();
+            assert_eq!(titles, ["Hello,", "Line one", "Today is {{year}}.", "Bye {{who}}"]);
+            assert_eq!(items[1].badge, "+1 lines");
+            assert_eq!(checked, &[false; 4]);
+        }
+        // One paragraph needs no list.
+        assert_eq!(typed(&mut e, " :one").map(|x| x.text), Some("only one".into()));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn paragraph_pick_keeps_variables_that_a_used_variable_needs() {
+        let base = r#"
+matches:
+  - trigger: ":rep"
+    snip: { pick: many }
+    replace: "x {{b}}\n\ny {{c}}"
+    vars:
+      - { name: a, type: echo, params: { echo: "A" } }
+      - { name: b, type: echo, params: { echo: "{{a}}!" } }
+      - { name: c, type: shell, params: { cmd: "exit 1" } }
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("config")).unwrap();
+        std::fs::create_dir_all(dir.path().join("match")).unwrap();
+        std::fs::write(dir.path().join("config/default.yml"), "").unwrap();
+        std::fs::write(dir.path().join("match/base.yml"), base).unwrap();
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let mut e = Engine::load_with(dir.path(), Box::new(Check(vec![0], seen))).unwrap();
+        assert_eq!(typed(&mut e, ":rep").map(|x| x.text), Some("x A!".into()));
+    }
+
+    #[test]
+    fn a_canceled_paragraph_pick_inserts_nothing() {
+        let base = "matches:\n  - trigger: \":rep\"\n    snip: { pick: many }\n    replace: \"a\\n\\nb\"\n";
+        let (mut e, _d) = engine(&[("match/base.yml", base)]);
+        assert_eq!(typed(&mut e, ":rep"), None);
     }
 
     #[test]
