@@ -72,7 +72,7 @@ snipctl overlaps --own
 | `conflicts` | none | `{conflicts}`: each trigger that several active matches share, winner first, with file, index and priority |
 | `overlaps` | `own` (optional, default false) | `{overlaps}`: each pair of triggers where the `short` one is the start of the `long` one, with the matches of each. With `own`, pairs that only involve files under `match/packages/` are left out |
 
-Paths are relative to the base folder, use `/`, and must be `.yml` or `.yaml` files under `match/` or `config/`.
+Paths are relative to the base folder, use `/`, and must be `.yml` or `.yaml` files. A file must be under `match/` or `config/`, or espanso must load it through `imports`, `includes` or `extra_includes`. An example is a `_global_vars.yml` in the base folder that `config/default.yml` includes.
 
 Error codes:
 

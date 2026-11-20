@@ -275,7 +275,7 @@ impl Workspace {
             }
             _ => {}
         }
-        if rel.starts_with("match/") {
+        if !rel.starts_with("config/") {
             MatchFile::parse(text)?;
             self.check_new_problems(&rel, old.as_deref().unwrap_or(""), text)?;
         } else {
@@ -403,22 +403,90 @@ impl Workspace {
         Ok(rel)
     }
 
-    /// Accepts only relative `.yml`/`.yaml` paths under `match/` or `config/`.
+    /// Accepts only relative `.yml`/`.yaml` paths inside the base folder:
+    /// under `match/` or `config/`, or a file that espanso loads through
+    /// `imports`, `includes` or `extra_includes` (for example a
+    /// `_global_vars.yml` in the folder root).
     fn check_path(&self, file: &str) -> Result<String> {
         let rel = file.replace('\\', "/");
         let path = Path::new(&rel);
         let safe = path.components().all(|c| matches!(c, Component::Normal(_)));
-        let top_ok = rel.starts_with("match/") || rel.starts_with("config/");
         let ext_ok = matches!(
             path.extension().and_then(|e| e.to_str()),
             Some("yml" | "yaml")
         );
-        if !safe || !top_ok || !ext_ok {
+        let top_ok = || rel.starts_with("match/") || rel.starts_with("config/") || self.is_loaded(&rel);
+        if !safe || !ext_ok || !top_ok() {
             return Err(SnipError::InvalidInput(format!(
-                "`{file}` must be a relative .yml path under match/ or config/"
+                "`{file}` must be a relative .yml path under match/ or config/, or a file that espanso loads"
             )));
         }
         Ok(rel)
+    }
+
+    /// The match files that espanso loads for any configuration, as
+    /// canonical paths.
+    fn loaded_files(&self) -> Result<Vec<PathBuf>> {
+        let (configs, _, _) = espanso_config::load(&self.base)?;
+        let mut out: Vec<PathBuf> = configs
+            .configs()
+            .iter()
+            .flat_map(|c| c.match_paths().to_vec())
+            .filter_map(|p| Path::new(&p).canonicalize().ok())
+            .collect();
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
+    /// True when espanso loads the file at `rel`.
+    fn is_loaded(&self, rel: &str) -> bool {
+        let Ok(abs) = self.base.join(rel).canonicalize() else { return false };
+        self.loaded_files().is_ok_and(|files| files.contains(&abs))
+    }
+
+    /// The file that holds the global variables: the first loaded file with
+    /// a `global_vars` list, as a path relative to the base folder. Files
+    /// under `match/packages/` do not count, because snip does not write
+    /// them.
+    pub fn global_vars_file(&self) -> Result<Option<String>> {
+        let base = self.base.canonicalize()?;
+        for abs in self.loaded_files()? {
+            let Ok(rel) = abs.strip_prefix(&base) else { continue };
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            if is_read_only(&rel) {
+                continue;
+            }
+            let Ok(text) = read_text(&abs) else { continue };
+            if MatchFile::parse(&text).is_ok_and(|m| !m.global_vars.is_empty()) {
+                return Ok(Some(rel));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Adds `var` (one variable as YAML, with `name` and `type`) to the
+    /// `global_vars` list of `global_vars_file()`, or of `fallback` when no
+    /// loaded file has that list. The rest of the file, comments too, stays
+    /// as it is. Returns the file that changed.
+    pub fn add_global_var(&self, var: &Value, fallback: &str) -> Result<String> {
+        let name = var
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|n| !n.is_empty())
+            .ok_or_else(|| SnipError::InvalidInput("the variable has no name".into()))?;
+        if self.global_vars()?.iter().any(|(n, _)| n == name) {
+            return Err(SnipError::InvalidInput(format!("a global variable named `{name}` already exists")));
+        }
+        let file = match self.global_vars_file()? {
+            Some(f) => f,
+            None => fallback.to_string(),
+        };
+        let current = self.read_file(&file)?;
+        let entry = serde_norway::to_string(var).map_err(|e| SnipError::InvalidYaml(e.to_string()))?;
+        let text = with_global_var(&current.text, &entry);
+        self.write_file(&file, &text, Some(&current.hash))?;
+        Ok(file)
     }
 
     fn yaml_files(&self, dir: &str) -> Vec<String> {
@@ -481,6 +549,59 @@ fn level_name(level: &espanso_config::error::ErrorLevel) -> String {
         espanso_config::error::ErrorLevel::Error => "error".into(),
         espanso_config::error::ErrorLevel::Warning => "warning".into(),
     }
+}
+
+/// `text` with `entry` (one variable as YAML, without the leading `- `)
+/// added at the end of its top-level `global_vars:` list. A file without
+/// that list gets one at its end.
+fn with_global_var(text: &str, entry: &str) -> String {
+    let nl = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let start = lines.iter().position(|l| l.trim_end().starts_with("global_vars:"));
+    // The new entry takes the indent of the list's first entry.
+    let indent = start
+        .and_then(|s| lines[s + 1..].iter().find(|l| l.trim_start().starts_with("- ")))
+        .map_or(2, |l| l.len() - l.trim_start().len());
+    let pad = " ".repeat(indent);
+    let item: String = entry
+        .trim_end()
+        .lines()
+        .enumerate()
+        .map(|(i, l)| if i == 0 { format!("{pad}- {l}{nl}") } else { format!("{pad}  {l}{nl}") })
+        .collect();
+    let Some(start) = start else {
+        let mut out = text.to_string();
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push_str(nl);
+        }
+        out.push_str("global_vars:");
+        out.push_str(nl);
+        out.push_str(&item);
+        return out;
+    };
+    // The list ends before the next top-level key. Blank lines and
+    // comments at the end of the list stay after the new entry.
+    let mut end = start + 1;
+    let mut last = start + 1;
+    while end < lines.len() {
+        let l = lines[end];
+        let t = l.trim_start();
+        let top = !l.starts_with([' ', '\t']) && !t.is_empty() && !t.starts_with('#') && !t.starts_with('-');
+        if top {
+            break;
+        }
+        if !t.trim().is_empty() && !t.starts_with('#') {
+            last = end + 1;
+        }
+        end += 1;
+    }
+    let mut out: String = lines[..last].concat();
+    if !out.ends_with('\n') {
+        out.push_str(nl);
+    }
+    out.push_str(&item);
+    out.push_str(&lines[last..].concat());
+    out
 }
 
 /// Files under `match/packages/` belong to the espanso package manager.
@@ -602,5 +723,45 @@ mod tests {
             ws.global_vars().unwrap(),
             vec![("paste".to_string(), "clipboard".to_string()), ("who".to_string(), "echo".to_string())]
         );
+    }
+
+    #[test]
+    fn a_new_global_variable_goes_to_the_end_of_the_list() {
+        let text = "# top\nglobal_vars:\n  - name: a\n    type: echo # note\n\n# tail\nmatches:\n  - trigger: x\n";
+        assert_eq!(
+            with_global_var(text, "name: b\ntype: date\n"),
+            "# top\nglobal_vars:\n  - name: a\n    type: echo # note\n  - name: b\n    type: date\n\n# tail\nmatches:\n  - trigger: x\n"
+        );
+        assert_eq!(
+            with_global_var("global_vars:\n- name: a\n", "name: b\n"),
+            "global_vars:\n- name: a\n- name: b\n"
+        );
+        assert_eq!(with_global_var("matches: []", "name: b\n"), "matches: []\nglobal_vars:\n  - name: b\n");
+    }
+
+    #[test]
+    fn a_variable_moves_into_the_loaded_global_vars_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("config")).unwrap();
+        fs::create_dir_all(dir.path().join("match")).unwrap();
+        fs::write(dir.path().join("config/default.yml"), "extra_includes:\n  - \"../_g.yml\"\n").unwrap();
+        fs::write(dir.path().join("_g.yml"), "global_vars:\n  - name: who\n    type: echo\n    params:\n      echo: me\n")
+            .unwrap();
+        fs::write(dir.path().join("match/base.yml"), "matches:\n  - trigger: \":a\"\n    replace: \"x\"\n").unwrap();
+        fs::write(dir.path().join("stray.yml"), "matches: []\n").unwrap();
+        let ws = Workspace::open(Some(dir.path().to_path_buf())).unwrap();
+
+        // A loaded file outside match/ is readable. A file that espanso
+        // does not load is not.
+        assert!(ws.read_file("_g.yml").is_ok());
+        assert!(ws.read_file("stray.yml").is_err());
+        assert_eq!(ws.global_vars_file().unwrap().as_deref(), Some("_g.yml"));
+
+        let var: Value = serde_norway::from_str("name: sig\ntype: echo\nparams:\n  echo: Ray\n").unwrap();
+        assert_eq!(ws.add_global_var(&var, "match/base.yml").unwrap(), "_g.yml");
+        let names: Vec<String> = ws.global_vars().unwrap().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, vec!["sig".to_string(), "who".to_string()]);
+        // The same name twice is refused.
+        assert!(ws.add_global_var(&var, "match/base.yml").is_err());
     }
 }

@@ -648,6 +648,28 @@ impl EditorView {
         });
     }
 
+    /// Moves variable `vi` into the file that holds the global variables,
+    /// and removes it from the match. `{{name}}` in the text then takes the
+    /// global value. The match file changes only when the user saves.
+    fn make_global(&mut self, vi: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(ws), Some(cur)) = (&self.ws, &self.current) else { return };
+        let Some(var) = self.collect(cx).and_then(|f| f.vars.get(vi).cloned()) else { return };
+        let name = matchedit::var_get(&var, &["name"]);
+        match ws.add_global_var(&var, &cur.file) {
+            Ok(file) => {
+                self.edit_form(window, cx, |f| {
+                    if vi < f.vars.len() {
+                        f.vars.remove(vi);
+                    }
+                });
+                self.refresh_list(cx);
+                self.set_status(format!("Moved {name} to the global variables in {file}. Save to remove it from this match."), false);
+            }
+            Err(e) => self.set_status(format!("Cannot make {name} global: {e}"), true),
+        }
+        cx.notify();
+    }
+
     /// Saves the match. Returns whether it is saved.
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let (Some(ws), Some(cur)) = (&self.ws, &self.current) else { return false };
@@ -1363,6 +1385,15 @@ impl EditorView {
                 ))
             });
             let bool_boxes: Vec<_> = bool_boxes.collect();
+            // A `global` variable only points at one, so it cannot become one.
+            let global_box = (kind != "global").then(|| {
+                Checkbox::new(SharedString::from(format!("vg-{vi}")))
+                    .label("Global")
+                    .checked(false)
+                    .small()
+                    .tooltip("Move this variable to the global variables, so every match can use it")
+                    .on_click(cx.listener(move |this, _: &bool, window, cx| this.make_global(vi, window, cx)))
+            });
             let params: Vec<_> = inp.params.iter().map(|(path, _, input)| {
                 let el = match input {
                     ParamInput::Line(s) => Input::new(s).small().into_any_element(),
@@ -1392,6 +1423,7 @@ impl EditorView {
                         .child(type_button)
                         .children(bool_boxes)
                         .child(div().flex_1())
+                        .children(global_box)
                         .child(icon(format!("rm-var-{vi}").into(), IconName::Close, "Remove this variable").on_click(
                             cx.listener(move |this, _, window, cx| {
                                 this.edit_form(window, cx, |f| {
