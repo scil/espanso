@@ -212,7 +212,12 @@ impl SettingsView {
     }
 
     fn input(&self, state: &Entity<InputState>, wide: bool) -> AnyElement {
-        div().w(px(if wide { 200.0 } else { 90.0 })).child(Input::new(state).small()).into_any_element()
+        self.input_off(state, wide, false)
+    }
+
+    /// An input box that is grey and takes no edits when `off`.
+    fn input_off(&self, state: &Entity<InputState>, wide: bool, off: bool) -> AnyElement {
+        div().w(px(if wide { 200.0 } else { 90.0 })).child(Input::new(state).small().disabled(off)).into_any_element()
     }
 
     fn radios(
@@ -287,13 +292,23 @@ impl Render for SettingsView {
                 cx,
             ));
 
-        let prefix = section("Prefix trigger", &theme).child(self.row(
-            "Wait time (ms)",
-            "prefix-wait-ms",
-            self.input(&self.prefix_wait_ms, false),
-            Some("A trigger that starts a longer trigger waits for the next key. 0: no time limit."),
-            cx,
-        ));
+        // A snip feature that espanso lacks: grey and fixed while the
+        // compatibility box is checked.
+        let off = self.espanso_compat;
+        let prefix = section("Prefix trigger", &theme).child(
+            self.row(
+                "Wait time (ms)",
+                "prefix-wait-ms",
+                self.input_off(&self.prefix_wait_ms, false, off),
+                Some(if off {
+                    "Off in espanso compatibility mode: a trigger that starts a longer trigger expands at once."
+                } else {
+                    "A trigger that starts a longer trigger waits for the next key. 0: no time limit."
+                }),
+                cx,
+            )
+            .when(off, |d| d.opacity(0.5)),
+        );
 
         let compat_box = Checkbox::new("espanso-compat")
             .label("espanso compatibility mode")
@@ -422,10 +437,10 @@ impl Render for SettingsView {
             .flex_col()
             .gap_4()
             .pr_2()
+            .child(compat)
             .child(popup)
             .child(insert)
             .child(prefix)
-            .child(compat)
             .child(startup);
         div()
             .size_full()

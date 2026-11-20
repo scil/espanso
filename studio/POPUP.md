@@ -196,10 +196,10 @@ The edit session shows the settings in its right half, in place of the edit form
 
 | Group | Settings |
 | --- | --- |
+| Compatibility | espanso compatibility mode. |
 | Popup | Trigger, Tab key. |
 | Insert | Long text (paste or type), short text limit, characters per call, gap between calls. |
 | Prefix trigger | Wait time. |
-| Compatibility | espanso compatibility mode. |
 | Startup and rights | Start at sign-in, Pause expansion, Restart as administrator, Log. |
 
 espanso compatibility mode (`espanso-compat = true`, or the `--espanso-compat` flag) makes snip expand as espanso does, so snippets behave the same in both programs. The panel lists what it turns off, from `COMPAT_OFF` in `popup-core/src/settings.rs`:
@@ -209,7 +209,7 @@ espanso compatibility mode (`espanso-compat = true`, or the `--espanso-compat` f
 - `snip.pick` is ignored. A snippet always inserts its whole text.
 - Caps Lock, Ctrl+P and Ctrl+Caps Lock start no paragraph pick and no text pick. Caps Lock goes to Windows as usual.
 
-The popup, its search, the edit session and the settings panel stay on, because they only find and edit snippets.
+The popup, its search, the edit session and the settings panel stay on, because they only find and edit snippets. The Compatibility group comes first in the panel. While its box is checked, the settings of the features that it turns off are grey and take no edits. Today that is the prefix trigger wait time.
 
 "Save and restart snip" writes the file and starts snip again with the same command line, because the hook and the engine read the settings only at the start. The new process has the rights of the old one, so an administrator snip restarts without a consent prompt. A setting that a command line flag sets shows its value as text, not as a box. Start at sign-in, Pause expansion, Restart as administrator and Open log act at once, as the tray items do.
 
