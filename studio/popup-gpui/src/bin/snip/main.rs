@@ -23,6 +23,7 @@
 mod editor;
 mod form_view;
 mod settings_view;
+mod text_pick;
 mod tray;
 
 use std::collections::HashMap;
@@ -82,9 +83,8 @@ enum ToEngine {
     Key(Input),
     /// The user picked a snippet in the popup. `erase` is the number of
     /// characters of the popup trigger and keyword before the caret.
-    /// With `paragraphs` (Ctrl+P), a list first asks which paragraphs of
-    /// the snippet to insert.
-    Insert { id: i32, erase: usize, paragraphs: bool },
+    /// `how` says whether the user first picks a part of the snippet.
+    Insert { id: i32, erase: usize, how: InsertAs },
     /// Load the configuration again.
     Reload,
     /// Ctrl+E or Ctrl+N in the popup: erase the popup trigger and the
@@ -93,12 +93,25 @@ enum ToEngine {
     Editor { erase: usize, request: editor::Request },
 }
 
+/// How the popup inserts a snippet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InsertAs {
+    /// The whole text: Enter, Tab or a click.
+    Whole,
+    /// Ctrl+P or Caps Lock: a list asks which paragraphs to insert.
+    Paragraphs,
+    /// Ctrl+Caps Lock: a window shows the text, and the user selects the
+    /// part to insert.
+    Text,
+}
+
 /// Loads the engine and publishes its snippets. On failure, a loaded list
 /// stays, so a bad edit does not empty the popup.
 fn load_engine(base: &std::path::Path, ui: &Sender<Ui>, shared: &Arc<Shared>) -> Option<Engine> {
     let ask = UiAsk { ui: ui.clone(), shared: shared.clone() };
     match Engine::load_with(base, Box::new(ask)) {
-        Ok(engine) => {
+        Ok(mut engine) => {
+            engine.set_compat(shared.is_compat());
             let mut entries = engine.entries();
             // The engine does not know the file of a match. The file filter
             // of the edit session needs it, so take it from the match files.
@@ -231,16 +244,36 @@ fn run_engine(
                     engine = e;
                 }
             }
-            ToEngine::Insert { id, erase, paragraphs } => {
+            ToEngine::Insert { id, erase, how } => {
                 let app = focus::foreground_app();
-                let rendered =
-                    if paragraphs { engine.render_paragraphs_by_id(id, &app) } else { engine.render_by_id(id, &app) };
-                match rendered {
-                    Ok(x) => {
-                        perform(&Expansion { erase, ..x });
-                        engine.inserted();
+                let rendered = match how {
+                    InsertAs::Paragraphs => engine.render_paragraphs_by_id(id, &app),
+                    InsertAs::Whole | InsertAs::Text => engine.render_by_id(id, &app),
+                };
+                let rendered = match (how, rendered) {
+                    (InsertAs::Text, Ok(x)) => {
+                        let ask = UiAsk { ui: ui.clone(), shared: shared.clone() };
+                        match ask.select_text(x.text.clone()) {
+                            // The whole text keeps its cursor hint.
+                            Some(t) if t == x.text => Some(x),
+                            // A part has no cursor hint: the caret stays
+                            // after the text.
+                            Some(t) => Some(Expansion { text: t, lefts: 0, ..x }),
+                            None => {
+                                popup_core::log::line(&format!("engine: text pick of match {id} canceled"));
+                                None
+                            }
+                        }
                     }
-                    Err(e) => popup_core::log::line(&format!("engine: match {id} not rendered: {e}")),
+                    (_, Ok(x)) => Some(x),
+                    (_, Err(e)) => {
+                        popup_core::log::line(&format!("engine: match {id} not rendered: {e}"));
+                        None
+                    }
+                };
+                if let Some(x) = rendered {
+                    perform(&Expansion { erase, ..x });
+                    engine.inserted();
                 }
                 // The hook stays active until the text is in, so keys typed
                 // meanwhile do not open a new session halfway.
@@ -302,6 +335,30 @@ impl Ask for UiAsk {
 }
 
 impl UiAsk {
+    /// Shows the text pick window and waits for the text to insert: the
+    /// selected part, or the whole text. `None` if the user canceled.
+    fn select_text(&self, text: String) -> Option<String> {
+        // The window takes the keyboard focus, so the hook must pass keys.
+        // The popup already closed when the user accepted.
+        self.shared.deactivate();
+        let target = focus::foreground();
+        let caret = caret::locate(Duration::from_millis(150));
+        let (reply, answer) = mpsc::channel();
+        popup_core::log::line(&format!("text pick: open, {} characters", text.chars().count()));
+        if self.ui.send(Ui::TextPick { text, caret, reply }).is_err() {
+            return None;
+        }
+        let answer = answer.recv().ok().flatten();
+        // The focus goes back to the application, so the erase and the
+        // text go there.
+        if let Some(h) = target {
+            if focus::foreground().is_some_and(focus::is_own) {
+                focus::restore(h);
+            }
+        }
+        answer
+    }
+
     /// Shows a pick list in the popup and waits for the picked indexes.
     /// `checked` gives the list check boxes and their start state.
     fn show_pick(&self, items: Vec<PickItem>, checked: Option<Vec<bool>>) -> Option<Vec<usize>> {
@@ -354,6 +411,9 @@ enum Ui {
     Hook(HookEvent),
     /// Show a form near the caret and send the answer on `reply`.
     Form { form: Form, caret: Caret, reply: form_view::Reply },
+    /// Show the text pick window near the caret and send the text to
+    /// insert on `reply`.
+    TextPick { text: String, caret: Caret, reply: text_pick::Reply },
     /// Show a pick list in the popup and send the picked indexes on
     /// `reply`. `checked` gives the list check boxes.
     Pick { items: Vec<PickItem>, checked: Option<Vec<bool>>, caret: Caret, reply: Sender<Option<Vec<usize>>> },
@@ -704,6 +764,9 @@ impl Popup {
     fn end_edit(&mut self, give_back: bool, then: Option<AfterEdit>, cx: &mut Context<Self>) {
         let Some(edit) = self.edit.take() else { return };
         popup_core::log::line(&format!("ui edit session: end, give back focus {give_back}"));
+        // Caps Lock goes to the applications again at once, not at the
+        // next tick.
+        self.shared.set_list_keys(false);
         self.open = false;
         self.shown = None;
         self.hovered = None;
@@ -756,12 +819,18 @@ impl Popup {
         cx.notify();
     }
 
-    /// Inserts the snippet of `row` from the list-only mode: the window that
-    /// had focus gets it back, and then the engine types the text. The typed
-    /// trigger is already gone, so it erases nothing.
-    fn insert_from_list(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+    /// Inserts the snippet of `row` from the edit session list: the window
+    /// that had focus gets it back, and then the engine types the text. The
+    /// typed trigger is already gone, so it erases nothing. An open form
+    /// with unsaved edits keeps the session.
+    fn insert_from_list(&mut self, row: usize, how: InsertAs, window: &mut Window, cx: &mut Context<Self>) {
         if self.edit.as_ref().is_some_and(|e| e.from_tray) {
             self.edit_row(row, window, cx);
+            return;
+        }
+        if self.edit_dirty(cx) {
+            self.note = Some("Save or close the form first.".into());
+            cx.notify();
             return;
         }
         let Some(snips) = self.snap.clone() else { return };
@@ -774,7 +843,7 @@ impl Popup {
         let id = e.id;
         let engine = self.engine.clone();
         let then: AfterEdit = Box::new(move || {
-            let _ = engine.send(ToEngine::Insert { id, erase: 0, paragraphs: false });
+            let _ = engine.send(ToEngine::Insert { id, erase: 0, how });
         });
         self.end_edit(true, Some(then), cx);
     }
@@ -787,15 +856,29 @@ impl Popup {
     }
 
     /// Keys while the list has focus in the edit session. They work as in
-    /// the popup: type to search, Up and Down move, Enter inserts, Ctrl+E or
-    /// Right edits, Ctrl+N makes a new snippet, Esc closes the popup. With
-    /// the form open, Up and Down also show the row in the form while the
-    /// list keeps the focus. Right, Ctrl+E or Enter then puts the cursor in
-    /// the form, and Esc closes the form.
+    /// the popup: type to search, Up and Down move, Enter inserts, Tab as
+    /// `--tab` says, Ctrl+1 to Ctrl+9 insert that row, Alt+1 to Alt+9 select
+    /// it, Ctrl+P inserts as a paragraph pick, Ctrl+E or Right edits, Ctrl+N makes a new snippet,
+    /// Esc closes the popup. Caps Lock and Ctrl+Caps Lock come from the hook
+    /// (see [`hook::Shared::set_list_keys`]). With the form open, Up and Down
+    /// also show the row in the form while the list keeps the focus. Right,
+    /// Ctrl+E or Enter then puts the cursor in the form, and Esc closes the
+    /// form.
     fn list_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let k = &ev.keystroke;
         let m = k.modifiers;
-        if m.alt || m.platform {
+        if m.platform {
+            return;
+        }
+        // Alt+1 to Alt+9 selects that row, as in the popup.
+        if m.alt {
+            match k.key.as_str() {
+                d if !m.control && d.len() == 1 && ("1"..="9").contains(&d) => {
+                    self.select_row(d.parse::<usize>().unwrap_or(1) - 1, window, cx);
+                    cx.stop_propagation();
+                }
+                _ => {}
+            }
             return;
         }
         let form = self.form_view();
@@ -814,11 +897,20 @@ impl Popup {
                 None => self.end_edit(true, None, cx),
             },
             (false, "enter") if form.is_some() => self.enter_form(window, cx),
-            (false, "enter") => self.insert_from_list(self.selected, window, cx),
-            (true, d) if form.is_none() && d.len() == 1 && ("1"..="9").contains(&d) => {
+            (false, "enter") => self.insert_from_list(self.selected, InsertAs::Whole, window, cx),
+            (true, d) if d.len() == 1 && ("1"..="9").contains(&d) => {
                 let row = d.parse::<usize>().unwrap_or(1) - 1;
-                self.insert_from_list(row, window, cx);
+                if row < self.results.len() {
+                    self.insert_from_list(row, InsertAs::Whole, window, cx);
+                }
             }
+            (true, "p") if !self.args.espanso_compat => self.insert_from_list(self.selected, InsertAs::Paragraphs, window, cx),
+            (false, "tab") => match (self.args.tab, m.shift) {
+                (hook::TabKey::Accept, _) => self.insert_from_list(self.selected, InsertAs::Whole, window, cx),
+                (hook::TabKey::Move, false) => self.select_row(self.selected + 1, window, cx),
+                (hook::TabKey::Move, true) => self.select_row(self.selected.saturating_sub(1), window, cx),
+                (hook::TabKey::Ignore, _) => return,
+            },
             // Up and Down already show the row in the form.
             (false, "right") | (true, "e") => self.enter_form(window, cx),
             (true, "n") => {
@@ -864,6 +956,12 @@ impl Popup {
         if lost {
             self.end_edit(false, None, cx);
         }
+        // The hook handles Caps Lock while the session list has the focus.
+        let list_keys = active
+            && self.edit.as_ref().is_some_and(|e| !e.from_tray)
+            && self.list_focus.is_focused(window)
+            && !self.results.is_empty();
+        self.shared.set_list_keys(list_keys);
         let actions = self.tray.as_ref().map(|t| t.poll()).unwrap_or_default();
         for action in actions {
             self.tray_action(action, window, cx);
@@ -1155,6 +1253,9 @@ impl Popup {
                 // window while it updates another one.
                 cx.defer(move |cx| form_view::open(form, caret, reply, cx));
             }
+            Ui::TextPick { text, caret, reply } => {
+                cx.defer(move |cx| text_pick::open(text, caret, reply, cx));
+            }
             Ui::Base(b) => self.base = Some(b),
             Ui::Loaded(r) => {
                 self.loaded = match r {
@@ -1183,7 +1284,16 @@ impl Popup {
             }
             Ui::Hook(HookEvent::Accept { .. }) => self.accept(self.selected, cx),
             Ui::Hook(HookEvent::AcceptRow(row)) => self.accept(row, cx),
-            Ui::Hook(HookEvent::AcceptParagraphs) => self.accept_as(self.selected, true, cx),
+            Ui::Hook(HookEvent::SelectRow(row)) => self.select_shown(row, cx),
+            // From the edit session list (see `Shared::set_list_keys`).
+            Ui::Hook(HookEvent::AcceptParagraphs) if self.edit.is_some() => {
+                self.insert_from_list(self.selected, InsertAs::Paragraphs, window, cx)
+            }
+            Ui::Hook(HookEvent::AcceptText) if self.edit.is_some() => {
+                self.insert_from_list(self.selected, InsertAs::Text, window, cx)
+            }
+            Ui::Hook(HookEvent::AcceptParagraphs) => self.accept_as(self.selected, InsertAs::Paragraphs, cx),
+            Ui::Hook(HookEvent::AcceptText) => self.accept_as(self.selected, InsertAs::Text, cx),
             Ui::Hook(HookEvent::Edit) => self.open_from_popup(true),
             Ui::Hook(HookEvent::New { .. }) => self.open_from_popup(false),
             // From the popup: the popup itself shows the form.
@@ -1235,6 +1345,15 @@ impl Popup {
         self.scroll.scroll_to_item(0);
         self.shared.set_results(self.results.len());
         cx.notify();
+    }
+
+    /// Selects a row of the popup or of the session list, if it exists.
+    fn select_shown(&mut self, row: usize, cx: &mut Context<Self>) {
+        if row < self.results.len() {
+            self.selected = row;
+            self.scroll.scroll_to_item(row);
+            cx.notify();
+        }
     }
 
     fn refresh_snippets(&mut self) {
@@ -1479,12 +1598,12 @@ impl Popup {
     }
 
     fn accept(&mut self, row: usize, cx: &mut Context<Self>) {
-        self.accept_as(row, false, cx);
+        self.accept_as(row, InsertAs::Whole, cx);
     }
 
-    /// Inserts a row. With `paragraphs` (Ctrl+P), the snippet opens a list
-    /// that asks which of its paragraphs to insert.
-    fn accept_as(&mut self, row: usize, paragraphs: bool, cx: &mut Context<Self>) {
+    /// Inserts a row. `how` says whether the user first picks a part of
+    /// the snippet: its paragraphs or any text.
+    fn accept_as(&mut self, row: usize, how: InsertAs, cx: &mut Context<Self>) {
         if let Some(pick) = &self.pick {
             // With check boxes, the checked items go back. With none
             // checked, the selected row does.
@@ -1512,7 +1631,7 @@ impl Popup {
             return;
         };
         popup_core::log::line(&format!(
-            "ui accept: row {row} of {}, insertable {}, paragraphs {paragraphs}",
+            "ui accept: row {row} of {}, insertable {}, as {how:?}",
             self.results.len(),
             e.insertable
         ));
@@ -1523,7 +1642,7 @@ impl Popup {
         }
         let erase = self.trigger.chars().count() + self.keyword.chars().count();
         self.hide();
-        let _ = self.engine.send(ToEngine::Insert { id: e.id, erase, paragraphs });
+        let _ = self.engine.send(ToEngine::Insert { id: e.id, erase, how });
     }
 }
 
@@ -1598,7 +1717,7 @@ impl Render for Popup {
                             if this.form_view().is_some() {
                                 this.select_row(row, window, cx);
                             } else {
-                                this.insert_from_list(row, window, cx);
+                                this.insert_from_list(row, InsertAs::Whole, window, cx);
                             }
                         }))
                         .on_mouse_down(
@@ -1905,7 +2024,9 @@ fn kind(ev: &HookEvent) -> &'static str {
         HookEvent::EditClick => "edit click",
         HookEvent::Accept { .. } => "accept",
         HookEvent::AcceptRow(_) => "accept row",
+        HookEvent::SelectRow(_) => "select row",
         HookEvent::AcceptParagraphs => "accept as paragraphs",
+        HookEvent::AcceptText => "accept as text pick",
         HookEvent::Edit => "edit",
         HookEvent::New { .. } => "new",
         HookEvent::Toggle(_) => "toggle",
@@ -1926,6 +2047,10 @@ fn main() {
     }
 
     let shared = Arc::new(Shared::default());
+    shared.set_compat(args.espanso_compat);
+    if args.espanso_compat {
+        popup_core::log::line("espanso compatibility mode is on");
+    }
     let (ui_tx, ui_rx) = mpsc::channel();
     let (engine_tx, engine_rx) = mpsc::channel();
     {

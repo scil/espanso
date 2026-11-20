@@ -199,6 +199,9 @@ pub struct Engine {
     /// Source file and priority of each match. When matches share a
     /// trigger, the lowest priority wins.
     origins: Origins,
+    /// espanso compatibility mode: expand as espanso does. See
+    /// [`Engine::set_compat`].
+    compat: bool,
 }
 
 impl Engine {
@@ -302,6 +305,7 @@ impl Engine {
             triggers,
             pending: None,
             origins,
+            compat: false,
         })
     }
 
@@ -452,9 +456,10 @@ impl Engine {
         let best = priority::best(results.iter().map(|r| r.id), &self.origins)?;
         let level = self.origins.priority(best);
         let mut seen = HashSet::new();
+        // In compatibility mode every result counts as the same priority.
         let mut equal = results
             .into_iter()
-            .filter(|r| self.origins.priority(r.id) == level && seen.insert(r.id));
+            .filter(|r| (self.compat || self.origins.priority(r.id) == level) && seen.insert(r.id));
         let chosen = equal.next()?;
         Some((chosen, equal.collect()))
     }
@@ -491,6 +496,16 @@ impl Engine {
         (index < all.len()).then(|| all.swap_remove(index))
     }
 
+    /// espanso compatibility mode. With it on, the engine expands as
+    /// espanso does: a trigger that starts a longer trigger expands at
+    /// once, `snip.priority` is ignored so all matches of a shared trigger
+    /// go into the list, and `snip.pick` is ignored so the whole text goes
+    /// in.
+    pub fn set_compat(&mut self, on: bool) {
+        self.compat = on;
+        self.pending = None;
+    }
+
     /// Whether a trigger waits for the next key. A confirm key
     /// ([`Input::Confirm`]) expands it. With a time limit, the caller calls
     /// [`Engine::flush`] when no key comes in time.
@@ -507,7 +522,7 @@ impl Engine {
     /// Whether `typed` is the start of a longer trigger of the active
     /// configuration. Regex triggers do not count.
     fn extends(&self, typed: &str, app: &App) -> bool {
-        if !self.triggers.iter().any(|t| t.longer_than(typed)) {
+        if self.compat || !self.triggers.iter().any(|t| t.longer_than(typed)) {
             return false;
         }
         let active = self.active_ids(app);
@@ -627,7 +642,7 @@ impl Engine {
         // The user checks paragraphs first. Only the checked ones render, so
         // a variable that only an unchecked paragraph uses does not run.
         // `paragraphs` asks for the list also without `snip.pick`.
-        let pick = self.origins.picks.get(&m.id).copied();
+        let pick = self.origins.picks.get(&m.id).copied().filter(|_| !self.compat);
         let pick = pick.or(paragraphs.then_some(Pick { all_checked: true }));
         let picked = match pick {
             Some(pick) => Some(self.pick_pieces(&template.body, pick)?),
@@ -1442,6 +1457,29 @@ matches:
         let mine = "snip:\n  priority: personal\nmatches:\n  - trigger: \":x\"\n    replace: \"mine\"\n";
         let (mut e, _d) = engine(&[("match/base.yml", base), ("match/mine.yml", mine)]);
         assert_eq!(typed(&mut e, ":x").map(|x| x.text), Some("mine".into()));
+    }
+
+    #[test]
+    fn compat_mode_expands_as_espanso_does() {
+        let (mut e, _d) = engine(&[("match/base.yml", PREFIX)]);
+        e.set_compat(true);
+        // A trigger that starts a longer one expands at once.
+        assert_eq!(text(typed(&mut e, ";su")), Some((3, "update ".into(), 0)));
+        assert!(!e.waiting());
+        // The priority is ignored: equal matches open a list, which the
+        // test default cancels.
+        let base = "matches:\n  - trigger: \":x\"\n    replace: \"base\"\n";
+        let mine = "snip:\n  priority: personal\nmatches:\n  - trigger: \":x\"\n    replace: \"mine\"\n";
+        let (mut e, _d) = engine(&[("match/base.yml", base), ("match/mine.yml", mine)]);
+        e.set_compat(true);
+        assert_eq!(typed(&mut e, ":x"), None);
+        e.set_compat(false);
+        assert_eq!(typed(&mut e, " :x").map(|x| x.text), Some("mine".into()));
+        // `snip.pick` is ignored: the whole text goes in.
+        let pick = "matches:\n  - trigger: \":p\"\n    snip: { pick: many }\n    replace: \"a\\n\\nb\"\n";
+        let (mut e, _d) = engine(&[("match/base.yml", pick)]);
+        e.set_compat(true);
+        assert_eq!(typed(&mut e, ":p").map(|x| x.text), Some("a\n\nb".into()));
     }
 
     #[test]

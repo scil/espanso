@@ -61,6 +61,7 @@ pub struct SettingsView {
     tab: String,
     long_text: String,
     log: bool,
+    espanso_compat: bool,
     trigger: Entity<InputState>,
     short_limit: Entity<InputState>,
     type_chunk: Entity<InputState>,
@@ -89,6 +90,7 @@ pub fn running_settings(a: &Args) -> Settings {
         type_gap_ms: a.insert.pace.gap.as_millis() as u64,
         prefix_wait_ms: a.prefix_wait.as_millis() as u64,
         log: a.log.is_some(),
+        espanso_compat: a.espanso_compat,
     }
 }
 
@@ -105,6 +107,7 @@ impl SettingsView {
             tab: saved.tab.clone(),
             long_text: saved.long_text.clone(),
             log: saved.log,
+            espanso_compat: saved.espanso_compat,
             saved,
             running,
             fixed,
@@ -133,6 +136,7 @@ impl SettingsView {
             type_gap_ms: number(text(&self.type_gap_ms), "Gap between calls")?,
             prefix_wait_ms: number(text(&self.prefix_wait_ms), "Wait time")?,
             log: self.log,
+            espanso_compat: self.espanso_compat,
         })
     }
 
@@ -176,6 +180,7 @@ impl SettingsView {
             "type-gap-ms" => r.type_gap_ms.to_string(),
             "prefix-wait-ms" => r.prefix_wait_ms.to_string(),
             "log" => if r.log { "on" } else { "off" }.into(),
+            "espanso-compat" => if r.espanso_compat { "on" } else { "off" }.into(),
             _ => String::new(),
         };
         Some(format!("{v}  (set by --{key} on the command line)"))
@@ -290,6 +295,39 @@ impl Render for SettingsView {
             cx,
         ));
 
+        let compat_box = Checkbox::new("espanso-compat")
+            .label("espanso compatibility mode")
+            .checked(self.espanso_compat)
+            .small()
+            .on_click(cx.listener(|this, v: &bool, _, cx| {
+                this.espanso_compat = *v;
+                this.note = None;
+                cx.notify();
+            }))
+            .into_any_element();
+        let muted = theme.muted_foreground;
+        let compat = section("Compatibility", &theme)
+            .child(self.row(
+                "espanso",
+                "espanso-compat",
+                compat_box,
+                Some("snip expands as espanso does, so your snippets behave the same in both. With it on, these snip features are off:"),
+                cx,
+            ))
+            .child(
+                div()
+                    .pl(px(LABEL_W + 12.0))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .children(settings::COMPAT_OFF.iter().map(|line| {
+                        div().flex().gap_1().text_xs().text_color(muted).child("\u{2022}").child(div().min_w(px(0.0)).child(*line))
+                    }))
+                    .child(div().text_xs().text_color(muted).child(
+                        "The popup, its search, the edit session and these settings stay, because they only find and edit snippets.",
+                    )),
+            );
+
         let log_box = Checkbox::new("log")
             .label("Write events to events.log")
             .checked(self.log)
@@ -387,6 +425,7 @@ impl Render for SettingsView {
             .child(popup)
             .child(insert)
             .child(prefix)
+            .child(compat)
             .child(startup);
         div()
             .size_full()

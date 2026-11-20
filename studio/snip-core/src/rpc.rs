@@ -82,6 +82,7 @@ impl From<SnipError> for Failure {
 /// - `snippets.update` {file, index, hash, yaml}
 /// - `snippets.delete` {file, index, hash}
 /// - `validate` {}
+/// - `overlaps` {own?}
 pub const METHODS: &[&str] = &[
     "info",
     "files.list",
@@ -93,6 +94,7 @@ pub const METHODS: &[&str] = &[
     "snippets.update",
     "snippets.delete",
     "validate",
+    "overlaps",
 ];
 
 fn dispatch(ws: &Workspace, method: &str, p: &Value) -> Result<Value, Failure> {
@@ -126,6 +128,10 @@ fn dispatch(ws: &Workspace, method: &str, p: &Value) -> Result<Value, Failure> {
         }
         "validate" => json!({ "problems": ws.validate()? }),
         "conflicts" => json!({ "conflicts": ws.conflicts()? }),
+        "overlaps" => {
+            let own = p.get("own").and_then(Value::as_bool).unwrap_or(false);
+            json!({ "overlaps": ws.overlaps(own)? })
+        }
         _ => return Err(Failure::Method),
     };
     Ok(out)

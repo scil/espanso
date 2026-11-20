@@ -29,7 +29,19 @@ pub struct Settings {
     pub prefix_wait_ms: u64,
     /// Write events to `events.log` next to this file.
     pub log: bool,
+    /// espanso compatibility mode: snip expands as espanso does, and the
+    /// features that espanso lacks are off. See [`COMPAT_OFF`].
+    pub espanso_compat: bool,
 }
+
+/// What espanso compatibility mode turns off, one line each. The settings
+/// panel shows this list.
+pub const COMPAT_OFF: &[&str] = &[
+    "Prefix triggers do not wait: a trigger that starts a longer trigger expands at once.",
+    "snip.priority is ignored: all matches of a shared trigger go into the pick list.",
+    "snip.pick is ignored: a snippet always inserts its whole text.",
+    "No paragraph pick (Caps Lock, Ctrl+P) and no text pick (Ctrl+Caps Lock). Caps Lock works as usual.",
+];
 
 impl Default for Settings {
     fn default() -> Self {
@@ -42,6 +54,7 @@ impl Default for Settings {
             type_gap_ms: 5,
             prefix_wait_ms: 0,
             log: false,
+            espanso_compat: false,
         }
     }
 }
@@ -113,7 +126,7 @@ mod tests {
 
     #[test]
     fn the_text_reads_back_the_same() {
-        let s = Settings { tab: "move".into(), prefix_wait_ms: 300, log: true, ..Settings::default() };
+        let s = Settings { tab: "move".into(), prefix_wait_ms: 300, log: true, espanso_compat: true, ..Settings::default() };
         assert_eq!(Settings::parse(&s.to_text()).unwrap(), s);
     }
 

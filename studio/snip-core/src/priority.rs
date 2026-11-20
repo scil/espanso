@@ -11,7 +11,7 @@
 //! snip:
 //!   priority: personal
 //! matches:
-//!   - trigger: ";;sig"
+//!   - trigger: ",,sig"
 //!     replace: "Best regards"
 //! ```
 //!
@@ -276,6 +276,78 @@ pub fn conflicts(configs: &dyn ConfigStore, store: &dyn MatchStore, origins: &Or
     out
 }
 
+/// A trigger that is the start of a longer trigger of the same
+/// configuration, for example `,,gm` and `,,gmm`. The engine cannot expand
+/// the short one until the next key, so it waits for a confirm key.
+#[derive(Debug, Clone, Serialize)]
+pub struct Overlap {
+    pub short: String,
+    pub long: String,
+    pub short_matches: Vec<Contender>,
+    pub long_matches: Vec<Contender>,
+}
+
+/// Every pair of triggers where one is the start of the other, within one
+/// configuration. A pair that several configurations have is listed once.
+/// Sorted by the short trigger, then the long one.
+pub fn overlaps(configs: &dyn ConfigStore, store: &dyn MatchStore, origins: &Origins) -> Vec<Overlap> {
+    struct T {
+        text: String,
+        /// `text` in lower case when the trigger ignores case.
+        key: String,
+        case_insensitive: bool,
+        ids: Vec<i32>,
+    }
+    let contenders = |ids: &[i32]| -> Vec<Contender> {
+        ids.iter().map(|&id| Contender { id, origin: origins.by_id.get(&id).cloned() }).collect()
+    };
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut out = Vec::new();
+    let mut all = vec![configs.default()];
+    all.extend(configs.configs());
+    for config in all {
+        let set = store.query(config.match_paths());
+        let mut triggers: Vec<T> = Vec::new();
+        for m in &set.matches {
+            let MatchCause::Trigger(cause) = &m.cause else { continue };
+            for t in &cause.triggers {
+                let key = if cause.propagate_case { t.to_lowercase() } else { t.clone() };
+                match triggers.iter_mut().find(|x| x.key == key) {
+                    Some(x) if !x.ids.contains(&m.id) => x.ids.push(m.id),
+                    Some(_) => {}
+                    None => triggers.push(T {
+                        text: t.clone(),
+                        key,
+                        case_insensitive: cause.propagate_case,
+                        ids: vec![m.id],
+                    }),
+                }
+            }
+        }
+        // The same test as the engine: the long trigger's case rule
+        // applies to the short text.
+        for s in &triggers {
+            for l in &triggers {
+                let short = if l.case_insensitive { s.text.to_lowercase() } else { s.text.clone() };
+                if l.key.len() <= short.len() || !l.key.starts_with(&short) {
+                    continue;
+                }
+                if !seen.insert((s.key.clone(), l.key.clone())) {
+                    continue;
+                }
+                out.push(Overlap {
+                    short: s.text.clone(),
+                    long: l.text.clone(),
+                    short_matches: contenders(&s.ids),
+                    long_matches: contenders(&l.ids),
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| (&a.short, &a.long).cmp(&(&b.short, &b.long)));
+    out
+}
+
 /// The items of a match file's `matches:` list.
 fn items_of(doc: Option<&Value>) -> &[Value] {
     doc.and_then(|d| d.get("matches")).and_then(Value::as_sequence).map_or(&[], Vec::as_slice)
@@ -388,6 +460,21 @@ mod tests {
         assert_eq!(origins.problems.len(), 1);
         assert_eq!(origins.problems[0].file, "match/base.yml");
         assert!(origins.problems[0].message.starts_with("match 2 sets snip.priority"), "{:?}", origins.problems);
+    }
+
+    #[test]
+    fn reports_triggers_that_start_longer_ones() {
+        let dir = folder(&[(
+            "match/base.yml",
+            "matches:\n  - triggers: [\",,gm\", \",,ex\"]\n    replace: a\n  - trigger: \",,gmm\"\n    replace: b\n  - trigger: \",,GMMNO\"\n    replace: c\n    propagate_case: true\n  - trigger: \",,exp\"\n    replace: d\n  - trigger: \",,z\"\n    replace: e\n",
+        )]);
+        let base = dunce(dir.path());
+        let (configs, store, origins) = load(&base);
+        let found = overlaps(configs.as_ref(), store.as_ref(), &origins);
+        let pairs: Vec<_> = found.iter().map(|o| (o.short.as_str(), o.long.as_str())).collect();
+        // `,,GMMNO` ignores case, so `,,gm` and `,,gmm` are its start too.
+        assert_eq!(pairs, [(",,ex", ",,exp"), (",,gm", ",,GMMNO"), (",,gm", ",,gmm"), (",,gmm", ",,GMMNO")]);
+        assert_eq!(found[0].short_matches[0].origin.as_ref().unwrap().index, Some(0));
     }
 
     #[test]

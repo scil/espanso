@@ -87,9 +87,17 @@ pub enum HookEvent {
     /// paragraph pick, so a list asks which paragraphs to keep. The hook
     /// stays active until the UI calls [`Shared::deactivate`].
     AcceptParagraphs,
+    /// Ctrl+Caps Lock with at least one result: insert the selected
+    /// snippet as a text pick, so a window shows its text and the user
+    /// selects the part to insert. The hook stays active until the UI calls
+    /// [`Shared::deactivate`].
+    AcceptText,
     /// Ctrl+1 to Ctrl+9: insert the row with that number (0-based here).
     /// The hook stays active until the UI calls [`Shared::deactivate`].
     AcceptRow(usize),
+    /// Alt+1 to Alt+9 in the popup: select the row with that number
+    /// (0-based here), for example before Caps Lock.
+    SelectRow(usize),
     /// Ctrl+E or Right with at least one result: edit the selected snippet. The hook
     /// stays active until the UI calls [`Shared::deactivate`].
     Edit,
@@ -124,6 +132,13 @@ pub struct Shared {
     waiting: AtomicBool,
     results: AtomicUsize,
     popup: Mutex<Option<Rect>>,
+    /// The list of the edit session has the keyboard focus. The window
+    /// gets its keys from Windows then, but Caps Lock would switch the
+    /// capitals mode, so the hook handles it.
+    list_keys: AtomicBool,
+    /// espanso compatibility mode: Caps Lock, Ctrl+Caps Lock and Ctrl+P
+    /// start no pick and go to the application.
+    compat: AtomicBool,
 }
 
 impl Shared {
@@ -141,6 +156,20 @@ impl Shared {
     }
     pub fn is_waiting(&self) -> bool {
         self.waiting.load(Ordering::Relaxed)
+    }
+    /// Whether the list of the edit session has the keyboard focus. With
+    /// it, Caps Lock and Ctrl+Caps Lock send the same events as in the
+    /// popup.
+    pub fn set_list_keys(&self, on: bool) {
+        self.list_keys.store(on, Ordering::Relaxed);
+    }
+    /// espanso compatibility mode (see
+    /// [`crate::settings::COMPAT_OFF`]). Set once at the start.
+    pub fn set_compat(&self, on: bool) {
+        self.compat.store(on, Ordering::Relaxed);
+    }
+    pub fn is_compat(&self) -> bool {
+        self.compat.load(Ordering::Relaxed)
     }
     /// Number of results the popup shows now.
     pub fn set_results(&self, n: usize) {
@@ -227,14 +256,25 @@ pub enum Key {
     /// Tab with Shift.
     ShiftTab,
     Escape,
-    /// Shift alone, or Caps Lock with Ctrl, Alt or Win. It never changes
-    /// the state.
+    /// Shift alone, or Caps Lock with Alt or Win. It never changes the
+    /// state.
     Modifier,
     /// Caps Lock alone. With a result in the popup it inserts the selected
     /// snippet as a paragraph pick. Else it acts as [`Key::Modifier`].
     CapsLock,
+    /// Caps Lock with Ctrl, and no Alt or Win. With a result in the popup
+    /// it inserts the selected snippet as a text pick. Else it acts as
+    /// [`Key::Modifier`].
+    CtrlCapsLock,
     /// The Ctrl key alone. It starts a shortcut such as Ctrl+E.
     Ctrl,
+    /// The Alt key alone, without Ctrl or Win. It starts a shortcut such
+    /// as Alt+1, so it does not close the popup.
+    Alt,
+    /// Alt with a digit key 1 to 9 on the main keyboard, and no Ctrl or
+    /// Win. In the popup it selects that row; elsewhere it acts as
+    /// [`Key::Other`].
+    AltDigit(u8),
     /// Ctrl with a letter key, and no Alt or Win. The letter is lowercase.
     CtrlLetter(char),
     /// Ctrl with a digit key 1 to 9 on the main keyboard, and no Alt or Win.
@@ -388,7 +428,7 @@ impl Machine {
             (_, Key::Backspace) => Some(Input::Backspace),
             (_, Key::Enter) => Some(Input::Char('\n')),
             (_, Key::Tab) => Some(Input::Char('\t')),
-            (_, Key::Modifier | Key::CapsLock | Key::Ctrl) => None,
+            (_, Key::Modifier | Key::CapsLock | Key::CtrlCapsLock | Key::Ctrl | Key::Alt) => None,
             (
                 _,
                 Key::Up
@@ -398,7 +438,8 @@ impl Machine {
                 | Key::Escape
                 | Key::Other
                 | Key::CtrlLetter(_)
-                | Key::CtrlDigit(_),
+                | Key::CtrlDigit(_)
+                | Key::AltDigit(_),
             ) => {
                 Some(Input::Reset)
             }
@@ -435,6 +476,18 @@ impl Machine {
         }
         if self.active {
             self.active_key(key)
+        } else if self.shared.list_keys.load(Ordering::Relaxed)
+            && !self.shared.is_compat()
+            && matches!(key, Key::CapsLock | Key::CtrlCapsLock)
+        {
+            // The edit session list: the window handles all other keys.
+            let (event, what) = match key {
+                Key::CapsLock => (HookEvent::AcceptParagraphs, "paragraph pick"),
+                _ => (HookEvent::AcceptText, "text pick"),
+            };
+            crate::log::line(&format!("hook list key: {what}"));
+            self.emit(event);
+            Verdict::Swallow
         } else {
             self.idle_key(key);
             Verdict::Pass
@@ -462,9 +515,15 @@ impl Machine {
             Key::Backspace => {
                 self.recent.pop();
             }
-            Key::Modifier | Key::CapsLock | Key::Ctrl => {}
+            Key::Modifier | Key::CapsLock | Key::CtrlCapsLock | Key::Ctrl | Key::Alt => {}
             _ => self.recent.clear(),
         }
+    }
+
+    /// Whether Caps Lock, Ctrl+Caps Lock and Ctrl+P start a paragraph or
+    /// text pick: the popup shows results and compatibility mode is off.
+    fn picks_allowed(&self) -> bool {
+        self.shared.results.load(Ordering::Relaxed) > 0 && !self.shared.is_compat()
     }
 
     /// Ctrl+1 to Ctrl+9 picks a numbered row, if the list has it.
@@ -499,6 +558,11 @@ impl Machine {
                 Verdict::Swallow
             }
             Key::CtrlDigit(n) if self.digit_row(n) => Verdict::Swallow,
+            Key::AltDigit(n) if usize::from(n.max(1)) <= self.shared.results.load(Ordering::Relaxed) => {
+                crate::log::line(&format!("hook select row {n}"));
+                self.emit(HookEvent::SelectRow(usize::from(n.max(1)) - 1));
+                Verdict::Swallow
+            }
             Key::Char(c) => {
                 self.keyword.push(c);
                 self.emit(HookEvent::Query(self.keyword.clone()));
@@ -537,12 +601,17 @@ impl Machine {
                 self.cancel("escape");
                 Verdict::Swallow
             }
-            Key::CtrlLetter('p') | Key::CapsLock if self.shared.results.load(Ordering::Relaxed) > 0 => {
+            Key::CtrlLetter('p') | Key::CapsLock if self.picks_allowed() => {
                 crate::log::line("hook accept as paragraph pick");
                 self.emit(HookEvent::AcceptParagraphs);
                 Verdict::Swallow
             }
-            Key::Modifier | Key::CapsLock | Key::Ctrl => Verdict::Pass,
+            Key::CtrlCapsLock if self.picks_allowed() => {
+                crate::log::line("hook accept as text pick");
+                self.emit(HookEvent::AcceptText);
+                Verdict::Swallow
+            }
+            Key::Modifier | Key::CapsLock | Key::CtrlCapsLock | Key::Ctrl | Key::Alt => Verdict::Pass,
             Key::CtrlLetter('e') | Key::Right if self.shared.results.load(Ordering::Relaxed) > 0 => {
                 crate::log::line("hook edit");
                 self.emit(HookEvent::Edit);
@@ -553,8 +622,8 @@ impl Machine {
                 self.emit(HookEvent::New { keyword: self.keyword.clone() });
                 Verdict::Swallow
             }
-            Key::CtrlLetter(_) | Key::CtrlDigit(_) => {
-                self.cancel("ctrl shortcut");
+            Key::CtrlLetter(_) | Key::CtrlDigit(_) | Key::AltDigit(_) => {
+                self.cancel("ctrl or alt shortcut");
                 Verdict::Pass
             }
             Key::Right => {
@@ -628,9 +697,9 @@ impl Machine {
                 self.cancel("escape in pick list");
                 Verdict::Swallow
             }
-            Key::Modifier | Key::CapsLock | Key::Ctrl => Verdict::Pass,
+            Key::Modifier | Key::CapsLock | Key::CtrlCapsLock | Key::Ctrl | Key::Alt => Verdict::Pass,
             Key::CtrlDigit(n) if self.digit_row(n) => Verdict::Swallow,
-            Key::Right | Key::CtrlLetter(_) | Key::CtrlDigit(_) | Key::Other => {
+            Key::Right | Key::CtrlLetter(_) | Key::CtrlDigit(_) | Key::AltDigit(_) | Key::Other => {
                 self.cancel("other key in pick list");
                 Verdict::Pass
             }
@@ -786,6 +855,12 @@ mod win {
                     .unwrap_or(Verdict::Pass);
                     if verdict == Verdict::Swallow {
                         SWALLOWED.with(|s| s.borrow_mut().insert(kb.vkCode));
+                        // The application saw Alt go down and will see it
+                        // come up, with no key between: that opens its menu
+                        // bar. A key that does nothing comes between.
+                        if matches!(key, Key::AltDigit(_)) {
+                            crate::win::send_menu_mask();
+                        }
                         true
                     } else {
                         false
@@ -842,10 +917,17 @@ mod win {
         let (ctrl, alt) = (down(VK_CONTROL.0 as i32), down(VK_MENU.0 as i32));
         let win = down(VK_LWIN.0 as i32) || down(VK_RWIN.0 as i32);
         if is(VK_CAPITAL) {
-            return if ctrl || alt || win { Key::Modifier } else { Key::CapsLock };
+            return match (ctrl, alt || win) {
+                (_, true) => Key::Modifier,
+                (true, false) => Key::CtrlCapsLock,
+                (false, false) => Key::CapsLock,
+            };
         }
         if [VK_CONTROL, VK_LCONTROL, VK_RCONTROL].iter().any(|k| is(*k)) && !alt && !win {
             return Key::Ctrl;
+        }
+        if [VK_MENU, VK_LMENU, VK_RMENU].iter().any(|k| is(*k)) && !ctrl && !win {
+            return Key::Alt;
         }
         if [VK_CONTROL, VK_LCONTROL, VK_RCONTROL, VK_MENU, VK_LMENU, VK_RMENU, VK_LWIN, VK_RWIN]
             .iter()
@@ -862,6 +944,10 @@ mod win {
         // ASCII codes.
         if ctrl && !alt && !win && (0x31..=0x39).contains(&vk) {
             return Key::CtrlDigit(vk as u8 - 0x30);
+        }
+        // Alt with a digit, the same way.
+        if alt && !ctrl && !win && (0x31..=0x39).contains(&vk) {
+            return Key::AltDigit(vk as u8 - 0x30);
         }
         if ctrl || alt || win {
             return Key::Other;
@@ -1069,6 +1155,22 @@ mod tests {
     }
 
     #[test]
+    fn alt_digit_selects_a_numbered_row() {
+        let (mut m, rx, shared) = machine();
+        typed(&mut m, "//a");
+        shared.set_results(3);
+        // Alt alone keeps the popup.
+        assert_eq!(m.key(Key::Alt), Verdict::Pass);
+        assert!(m.is_active());
+        assert_eq!(m.key(Key::AltDigit(2)), Verdict::Swallow);
+        assert_eq!(events(&rx).last(), Some(&HookEvent::SelectRow(1)));
+        // No row 5: the shortcut goes to the application and the popup
+        // closes.
+        assert_eq!(m.key(Key::AltDigit(5)), Verdict::Pass);
+        assert_eq!(events(&rx).last(), Some(&HookEvent::Cancel));
+    }
+
+    #[test]
     fn ctrl_digit_picks_a_numbered_row() {
         let (mut m, rx, shared) = machine();
         typed(&mut m, "//a");
@@ -1185,6 +1287,54 @@ mod tests {
         // In a pick list, Caps Lock goes to the application.
         shared.start_pick_many();
         assert_eq!(m.key(Key::CapsLock), Verdict::Pass);
+    }
+
+    #[test]
+    fn compat_mode_starts_no_pick() {
+        let (mut m, rx, shared) = machine();
+        shared.set_compat(true);
+        typed(&mut m, "//a");
+        shared.set_results(3);
+        assert_eq!(m.key(Key::CapsLock), Verdict::Pass);
+        assert_eq!(m.key(Key::CtrlCapsLock), Verdict::Pass);
+        assert!(!events(&rx).iter().any(|e| matches!(e, HookEvent::AcceptParagraphs | HookEvent::AcceptText)));
+        // The edit session list leaves Caps Lock to Windows too.
+        m.key(Key::Escape);
+        shared.set_list_keys(true);
+        assert_eq!(m.key(Key::CapsLock), Verdict::Pass);
+    }
+
+    #[test]
+    fn caps_lock_keys_work_in_the_edit_session_list() {
+        let (mut m, rx, shared) = machine();
+        // Without the list focus, Caps Lock goes to the application.
+        assert_eq!(m.key(Key::CapsLock), Verdict::Pass);
+        shared.set_list_keys(true);
+        assert_eq!(m.key(Key::CapsLock), Verdict::Swallow);
+        assert_eq!(events(&rx).last(), Some(&HookEvent::AcceptParagraphs));
+        assert_eq!(m.key(Key::CtrlCapsLock), Verdict::Swallow);
+        assert_eq!(events(&rx).last(), Some(&HookEvent::AcceptText));
+        // Other keys go to the window.
+        assert_eq!(m.key(Key::Char('a')), Verdict::Pass);
+        shared.set_list_keys(false);
+        assert_eq!(m.key(Key::CtrlCapsLock), Verdict::Pass);
+    }
+
+    #[test]
+    fn ctrl_caps_lock_accepts_as_a_text_pick() {
+        let (mut m, rx, shared) = machine();
+        typed(&mut m, "//si");
+        // Without a result, the key goes to the application and the popup
+        // stays.
+        assert_eq!(m.key(Key::Ctrl), Verdict::Pass);
+        assert_eq!(m.key(Key::CtrlCapsLock), Verdict::Pass);
+        assert!(m.is_active());
+        shared.set_results(1);
+        assert_eq!(m.key(Key::CtrlCapsLock), Verdict::Swallow);
+        assert_eq!(events(&rx).last(), Some(&HookEvent::AcceptText));
+        // In a pick list, the key goes to the application.
+        shared.start_pick_many();
+        assert_eq!(m.key(Key::CtrlCapsLock), Verdict::Pass);
     }
 
     #[test]

@@ -48,6 +48,8 @@ pub struct Args {
     pub insert: Insert,
     pub prefix_wait: std::time::Duration,
     pub tab: crate::hook::TabKey,
+    /// espanso compatibility mode (see [`crate::settings::COMPAT_OFF`]).
+    pub espanso_compat: bool,
     /// The settings keys (`trigger`, `tab`, ...) that a command line flag
     /// set. They win over the settings file.
     pub from_cli: Vec<&'static str>,
@@ -68,6 +70,7 @@ impl Default for Args {
             insert: Insert::default(),
             prefix_wait: std::time::Duration::ZERO,
             tab: crate::hook::TabKey::default(),
+            espanso_compat: false,
             from_cli: Vec::new(),
         }
     }
@@ -103,6 +106,7 @@ impl Args {
         out.insert.pace.gap = std::time::Duration::from_millis(s.type_gap_ms);
         out.prefix_wait = std::time::Duration::from_millis(s.prefix_wait_ms);
         out.log = if s.log { settings::log_path() } else { None };
+        out.espanso_compat = s.espanso_compat;
         out
     }
 
@@ -124,6 +128,7 @@ impl Args {
                 "--query" => out.query = it.next().unwrap_or_default(),
                 "--base" => out.base = it.next().map(PathBuf::from),
                 "--allow-injected" => out.allow_injected = true,
+                "--espanso-compat" => out.espanso_compat = true,
                 "--log" => out.log = it.next().map(PathBuf::from),
                 "--long-text" => match it.next().as_deref() {
                     Some("paste") => out.insert.long = LongText::Paste,
@@ -177,6 +182,7 @@ fn setting_key(flag: &str) -> Option<&'static str> {
         "--type-gap-ms" => "type-gap-ms",
         "--prefix-wait-ms" => "prefix-wait-ms",
         "--log" => "log",
+        "--espanso-compat" => "espanso-compat",
         _ => return None,
     })
 }

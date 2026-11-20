@@ -8,7 +8,7 @@ use serde_norway::Value;
 
 use crate::error::{Problem, Result, SnipError};
 use crate::portability::{self, PortabilityReport};
-use crate::priority::{self, Conflict, Origins};
+use crate::priority::{self, Conflict, Origins, Overlap};
 use crate::yamlfile::{hash, Item, MatchFile};
 
 /// Environment variable that overrides the espanso base folder.
@@ -309,11 +309,42 @@ impl Workspace {
         Ok(problems)
     }
 
+    /// The global variables that espanso loads, as (name, type), sorted by
+    /// name, each name once. espanso's loader follows `imports`, `includes`
+    /// and `extra_includes`, so a file outside `match/` counts too. The
+    /// union covers every configuration, the per-application ones too.
+    pub fn global_vars(&self) -> Result<Vec<(String, String)>> {
+        let (configs, store, _) = espanso_config::load(&self.base)?;
+        let mut out: Vec<(String, String)> = configs
+            .configs()
+            .iter()
+            .flat_map(|c| store.query(c.match_paths()).global_vars)
+            .map(|v| (v.name.clone(), v.var_type.clone()))
+            .collect();
+        out.sort();
+        out.dedup_by(|a, b| a.0 == b.0);
+        Ok(out)
+    }
+
     /// Triggers that several active matches share, with the winner first.
     pub fn conflicts(&self) -> Result<Vec<Conflict>> {
         let (configs, store, _) = espanso_config::load(&self.base)?;
         let origins = Origins::load(&self.base, store.as_ref());
         Ok(priority::conflicts(configs.as_ref(), store.as_ref(), &origins))
+    }
+
+    /// Pairs of triggers where one is the start of the other. With `own`,
+    /// pairs that only involve files under `match/packages/` are left out.
+    pub fn overlaps(&self, own: bool) -> Result<Vec<Overlap>> {
+        let (configs, store, _) = espanso_config::load(&self.base)?;
+        let origins = Origins::load(&self.base, store.as_ref());
+        let mut out = priority::overlaps(configs.as_ref(), store.as_ref(), &origins);
+        if own {
+            let in_package =
+                |c: &priority::Contender| c.origin.as_ref().is_some_and(|o| o.file.starts_with("match/packages/"));
+            out.retain(|o| !o.short_matches.iter().chain(&o.long_matches).all(in_package));
+        }
+        Ok(out)
     }
 
     fn commit_match(&self, rel: &str, parsed: &MatchFile, new_text: &str) -> Result<()> {
@@ -547,4 +578,29 @@ fn snippet_matches(s: &Snippet, needle: &str) -> bool {
         || hit(&s.preview)
         || s.search_terms.iter().any(|t| hit(t))
         || hit(&s.file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn global_vars_come_from_files_that_the_config_includes() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("config")).unwrap();
+        fs::create_dir_all(dir.path().join("match")).unwrap();
+        fs::write(dir.path().join("config/default.yml"), "extra_includes:\n  - \"../_g.yml\"\n").unwrap();
+        // The file is outside `match/`, so only the include loads it.
+        fs::write(
+            dir.path().join("_g.yml"),
+            "global_vars:\n  - name: who\n    type: echo\n    params:\n      echo: me\n  - name: paste\n    type: clipboard\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("match/base.yml"), "matches:\n  - trigger: \":a\"\n    replace: \"{{who}}\"\n").unwrap();
+        let ws = Workspace::open(Some(dir.path().to_path_buf())).unwrap();
+        assert_eq!(
+            ws.global_vars().unwrap(),
+            vec![("paste".to_string(), "clipboard".to_string()), ("who".to_string(), "echo".to_string())]
+        );
+    }
 }

@@ -642,6 +642,15 @@ pub fn send_backspaces(n: usize) {
     send_taps(VK_BACK, n, "backspace");
 }
 
+/// Presses and releases key 0xE8, which no keyboard has and no program
+/// uses. Sent while Alt is down, it keeps the Alt release from opening the
+/// menu bar of the application.
+pub fn send_menu_mask() {
+    use windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY;
+    let vk = VIRTUAL_KEY(0xE8);
+    send(&[key(vk, KEYBD_EVENT_FLAGS(0)), key(vk, KEYEVENTF_KEYUP)]);
+}
+
 pub fn send_lefts(n: usize) {
     use windows::Win32::UI::Input::KeyboardAndMouse::VK_LEFT;
     send_taps(VK_LEFT, n, "left");

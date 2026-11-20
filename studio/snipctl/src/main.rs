@@ -60,6 +60,13 @@ enum Command {
     Validate,
     /// Print each trigger that several active matches share, winner first.
     Conflicts,
+    /// Print each pair of triggers where one is the start of the other,
+    /// for example `,,gm` and `,,gmm`. The short one needs a confirm key.
+    Overlaps {
+        /// Leave out pairs that only involve files under `match/packages/`.
+        #[arg(long)]
+        own: bool,
+    },
     /// Serve JSON-RPC 2.0 over standard input and output, one message per line.
     Serve,
 }
@@ -95,6 +102,7 @@ fn run(cli: Cli) -> Result<(), SnipError> {
         }
         Command::Validate => json!({ "problems": ws.validate()? }),
         Command::Conflicts => json!({ "conflicts": ws.conflicts()? }),
+        Command::Overlaps { own } => json!({ "overlaps": ws.overlaps(own)? }),
         Command::Serve => {
             let stdin = std::io::stdin();
             rpc::serve(&ws, stdin.lock(), std::io::stdout().lock())?;

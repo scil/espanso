@@ -229,15 +229,62 @@ impl MatchForm {
     }
 }
 
-/// A new, empty variable of type `kind`.
+/// A new variable of type `kind`. A date variable gets the format
+/// `%Y-%m-%d`, so it works at once; the other types start empty.
 pub fn new_var(name: &str, kind: &str) -> Value {
     let mut m = Mapping::new();
     m.insert("name".into(), name.into());
     m.insert("type".into(), kind.into());
     if VAR_TYPES.iter().any(|(t, p)| *t == kind && !p.is_empty()) {
-        m.insert("params".into(), Value::Mapping(Mapping::new()));
+        let mut params = Mapping::new();
+        if kind == "date" {
+            params.insert("format".into(), "%Y-%m-%d".into());
+        }
+        m.insert("params".into(), Value::Mapping(params));
     }
     Value::Mapping(m)
+}
+
+/// What each variable type gives, one line each, for the editor's help.
+pub const VAR_HELP: &[(&str, &str)] = &[
+    ("date", "the date or time, in a strftime format such as %Y-%m-%d"),
+    ("echo", "a fixed text"),
+    ("random", "one of the choices, picked at random"),
+    ("shell", "the output of a shell command"),
+    ("script", "the output of a script"),
+    ("clipboard", "the text on the clipboard"),
+    ("choice", "a value that you pick from a list"),
+    ("form", "the fields of a small form that you fill in"),
+    ("match", "the text of another snippet, by its trigger"),
+    ("global", "a global variable, by its name"),
+];
+
+/// The help line of a variable type, or "" for an unknown type.
+pub fn var_help(kind: &str) -> &'static str {
+    VAR_HELP.iter().find(|(t, _)| *t == kind).map(|(_, h)| *h).unwrap_or("")
+}
+
+/// A name for a new variable of type `kind` that no name in `taken` uses:
+/// `date1`, `date2` and so on.
+pub fn free_var_name(kind: &str, taken: &[String]) -> String {
+    (1..).map(|n| format!("{kind}{n}")).find(|n| !taken.contains(n)).unwrap_or_default()
+}
+
+/// The `{{` that the caret types a variable name after, in `text` with the
+/// caret at byte `caret`: the byte offset of `{{` and the name typed so
+/// far. `None` when the text between `{{` and the caret is not a name.
+pub fn open_braces(text: &str, caret: usize) -> Option<(usize, &str)> {
+    let before = text.get(..caret)?;
+    let start = before.rfind("{{")?;
+    let typed = &before[start + 2..];
+    typed.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-').then_some((start, typed))
+}
+
+/// The bytes that a picked name replaces: from the `{{` at `start` to the
+/// caret, and a `}}` right after the caret too.
+pub fn braces_span(text: &str, start: usize, caret: usize) -> std::ops::Range<usize> {
+    let end = if text.get(caret..).is_some_and(|r| r.starts_with("}}")) { caret + 2 } else { caret };
+    start..end
 }
 
 /// The text of a variable field. `path` is `["name"]`, `["type"]` or
@@ -635,6 +682,34 @@ fn plain_or_quoted(s: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn open_braces_finds_the_name_being_typed() {
+        let t = "Hi {{na";
+        assert_eq!(open_braces(t, t.len()), Some((3, "na")));
+        assert_eq!(open_braces("Hi {{", 5), Some((3, "")));
+        // A closed variable or a space ends it.
+        assert_eq!(open_braces("{{a}} b", 7), None);
+        assert_eq!(open_braces("{{a b", 5), None);
+        assert_eq!(open_braces("no braces", 9), None);
+        // Not on a character boundary.
+        assert_eq!(open_braces("{{é", 3), None);
+    }
+
+    #[test]
+    fn braces_span_takes_a_closing_pair_after_the_caret() {
+        assert_eq!(braces_span("{{na}} x", 0, 4), 0..6);
+        assert_eq!(braces_span("{{na x", 0, 4), 0..4);
+    }
+
+    #[test]
+    fn a_new_variable_gets_a_free_name_and_defaults() {
+        let taken = vec!["date1".to_string(), "x".to_string()];
+        assert_eq!(free_var_name("date", &taken), "date2");
+        assert_eq!(var_get(&new_var("d", "date"), &["params", "format"]), "%Y-%m-%d");
+        assert_eq!(var_get(&new_var("c", "clipboard"), &["params"]), "");
+        assert!(VAR_TYPES.iter().all(|(t, _)| !var_help(t).is_empty()));
+    }
+
     const ITEM: &str = "## greeting\n# 问候\ntrigger: \":hi\"   # inline\nreplace: |\n  Hello,\n\n  world\nlabel: 'Say hi'\nvars:\n  - name: d\n    type: date\n    params:\n      format: \"%H:%M\"\nfoo: kept   # unknown key";
 
     #[test]
@@ -676,9 +751,9 @@ mod tests {
     #[test]
     fn second_trigger_switches_to_a_list() {
         let mut f = MatchForm::from_yaml(ITEM).unwrap();
-        f.triggers.push(";;hi".into());
+        f.triggers.push(",,hi".into());
         let out = f.apply(ITEM).unwrap();
-        assert!(out.starts_with("## greeting\n# 问候\ntriggers:\n  - \":hi\"\n  - \";;hi\"\nreplace: |"), "{out}");
+        assert!(out.starts_with("## greeting\n# 问候\ntriggers:\n  - \":hi\"\n  - \",,hi\"\nreplace: |"), "{out}");
         // Back to one trigger: a one-item list stays a list.
         let mut g = MatchForm::from_yaml(&out).unwrap();
         g.triggers.pop();
@@ -736,13 +811,13 @@ mod tests {
     #[test]
     fn a_new_match_from_nothing() {
         let f = MatchForm {
-            triggers: vec![";;sig".into()],
+            triggers: vec![",,sig".into()],
             output: "replace".into(),
             body: "Best regards".into(),
             ..Default::default()
         };
         let out = f.apply("replace: \"\"").unwrap();
-        assert_eq!(out, "trigger: \";;sig\"\nreplace: Best regards");
+        assert_eq!(out, "trigger: \",,sig\"\nreplace: Best regards");
     }
 
     #[test]

@@ -102,7 +102,7 @@ In Notepad on Windows 11, UI Automation found the exact caret in 16 to 18 ms.
 
 1. You type the trigger, `,,` by default. The popup opens below the caret. It lists the snippets whose triggers start with `,,` first.
 2. You type the keyword. The characters go into the target application, and the popup filters its list after each one. Many triggers start with the popup trigger, so the popup compares the keyword with each snippet trigger without that prefix. For the keyword `doc`, `,,doc` comes first.
-3. Up and Down select a snippet. Enter or Tab inserts it. Ctrl+1 to Ctrl+9 inserts the row with that number. Caps Lock or Ctrl+P inserts the selected snippet as a paragraph pick. A list with check boxes asks which paragraphs to insert. This works for every snippet, with or without a `snip: { pick: many }` key (see [Paragraph picks](EXPANDER.md#paragraph-picks)). After each typed key, the first row is selected, so Enter or Tab inserts the first row. The `--tab` option changes what Tab does.
+3. Up and Down select a snippet. Enter or Tab inserts it. Ctrl+1 to Ctrl+9 inserts the row with that number. Alt+1 to Alt+9 only selects the row with that number, for example before Caps Lock or Ctrl+Caps Lock. Digits without Ctrl or Alt are part of the search, so triggers such as `,,anki2` still work. Caps Lock or Ctrl+P inserts the selected snippet as a paragraph pick. A list with check boxes asks which paragraphs to insert. This works for every snippet, with or without a `snip: { pick: many }` key (see [Paragraph picks](EXPANDER.md#paragraph-picks)). Ctrl+Caps Lock inserts the selected snippet as a text pick: a window shows the text of the snippet, and you select parts of it. Drag selects a part, and Ctrl+drag adds another part, so you can pick several. A press without Ctrl drops the parts picked before. Enter or the Insert button inserts the parts in text order, one per line. Shift+Enter breaks a line in the text. Without a selection, nothing is inserted and the window stays open. Esc or Cancel inserts nothing. You can also edit the text there before you insert it. After each typed key, the first row is selected, so Enter or Tab inserts the first row. The `--tab` option changes what Tab does.
 
 `,,.` repeats the last search. If `.` is the first keyword character, snip replaces it with the keyword of the last `,,` search, inserted or not. snip types that keyword into the application, and you can go on typing. Before the first search, `.` is an ordinary keyword character.
 
@@ -135,7 +135,7 @@ The insert flags in [Inserting text](#inserting-text) also apply.
 ### How the resident mode works
 
 - `popup_core::hook` installs low-level keyboard and mouse hooks (`WH_KEYBOARD_LL`, `WH_MOUSE_LL`) on a thread of its own. A state machine keeps the last typed characters and the keyword. It has no Windows code, so its tests run anywhere.
-- The hook passes characters and Backspace to the application. It swallows Up, Down, Enter, Tab (unless `--tab ignore`), Escape, Ctrl+E, Ctrl+N and clicks inside the popup, right clicks too. It also swallows Right, Caps Lock and Ctrl+P with a result, and Ctrl+1 to Ctrl+9 with that row. The application never sees these keys.
+- The hook passes characters and Backspace to the application. It swallows Up, Down, Enter, Tab (unless `--tab ignore`), Escape, Ctrl+E, Ctrl+N and clicks inside the popup, right clicks too. It also swallows Right, Caps Lock, Ctrl+Caps Lock and Ctrl+P with a result, and Ctrl+1 to Ctrl+9 and Alt+1 to Alt+9 with that row. After a swallowed Alt+digit, snip sends key 0xE8, which does nothing. Then the Alt release does not open the menu bar of the application. In espanso compatibility mode, Caps Lock, Ctrl+Caps Lock and Ctrl+P are not swallowed. The application never sees these keys.
 - The hook reads characters with `ToUnicodeEx` in the keyboard layout of the foreground window. Flag 4 keeps dead keys working in the application.
 - The hook ignores injected input for the keyword, so espanso's expansions and the popup's own key presses never extend it. Injected input from another program closes an open popup, because espanso then replaced the text at the caret. The popup marks its own input with `dwExtraInfo = OWN_INPUT`, so `--allow-injected` still ignores it.
 - A controller thread finds the caret for each session, so UI Automation never blocks the hook or the UI thread.
@@ -199,7 +199,17 @@ The edit session shows the settings in its right half, in place of the edit form
 | Popup | Trigger, Tab key. |
 | Insert | Long text (paste or type), short text limit, characters per call, gap between calls. |
 | Prefix trigger | Wait time. |
+| Compatibility | espanso compatibility mode. |
 | Startup and rights | Start at sign-in, Pause expansion, Restart as administrator, Log. |
+
+espanso compatibility mode (`espanso-compat = true`, or the `--espanso-compat` flag) makes snip expand as espanso does, so snippets behave the same in both programs. The panel lists what it turns off, from `COMPAT_OFF` in `popup-core/src/settings.rs`:
+
+- Prefix triggers do not wait. A trigger that starts a longer trigger expands at once.
+- `snip.priority` is ignored. All matches of a shared trigger go into the pick list.
+- `snip.pick` is ignored. A snippet always inserts its whole text.
+- Caps Lock, Ctrl+P and Ctrl+Caps Lock start no paragraph pick and no text pick. Caps Lock goes to Windows as usual.
+
+The popup, its search, the edit session and the settings panel stay on, because they only find and edit snippets.
 
 "Save and restart snip" writes the file and starts snip again with the same command line, because the hook and the engine read the settings only at the start. The new process has the rights of the old one, so an administrator snip restarts without a consent prompt. A setting that a command line flag sets shows its value as text, not as a box. Start at sign-in, Pause expansion, Restart as administrator and Open log act at once, as the tray items do.
 

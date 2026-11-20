@@ -11,14 +11,14 @@
 //! save, `reload` makes the engine load the configuration again.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::checkbox::Checkbox;
-use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState, Textarea, TextareaState};
-use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_kit::component::input::{self as input, Editor, EditorState, Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_kit::component::menu::{DropdownMenu, PopupMenu, PopupMenuItem};
 use gpui_kit::component::radio::RadioGroup;
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable};
@@ -28,7 +28,6 @@ use popup_core::focus;
 use serde_norway::Value;
 use snip_core::matchedit::{self, MatchForm, Param, OUTPUT_KEYS, VAR_TYPES};
 use snip_core::workspace::Snippet;
-use snip_core::yamlfile::MatchFile;
 use snip_core::{SnipError, Workspace};
 
 /// The height of the tab row above the form. The popup's list header in the
@@ -143,6 +142,25 @@ enum ParamInput {
     YamlOnly,
 }
 
+/// The open `{{` picker: the byte offset of `{{` in the text, the name
+/// typed after it, and the highlighted row.
+struct Picker {
+    start: usize,
+    typed: String,
+    selected: usize,
+}
+
+/// One row of the variable chips or of the `{{` picker.
+#[derive(Debug, Clone, PartialEq)]
+enum Pick {
+    /// A variable of this snippet, by name.
+    Own(String),
+    /// A global variable: name and type.
+    Global(String, String),
+    /// A new variable of this type.
+    New(&'static str),
+}
+
 struct VarInputs {
     name: Entity<InputState>,
     /// (path, kind, input) for each parameter of the type, then
@@ -171,8 +189,14 @@ pub struct EditorView {
     files: Vec<String>,
     /// Every match file, packages included. The Test button imports them.
     match_files: Vec<String>,
-    /// The names of the global variables in all match files.
-    global_names: HashSet<String>,
+    /// The global variables of all match files: (name, type), sorted by
+    /// name, each name once.
+    globals: Vec<(String, String)>,
+    /// The `{{` picker under the text box (see [`matchedit::open_braces`]).
+    picker: Option<Picker>,
+    /// The `{{` offset whose picker Esc closed. It stays closed until the
+    /// caret leaves that `{{`.
+    picker_closed: Option<usize>,
     target_file: String,
     current: Option<Current>,
     yaml: Entity<EditorState>,
@@ -236,7 +260,9 @@ impl EditorView {
             all: Vec::new(),
             files: Vec::new(),
             match_files: Vec::new(),
-            global_names: HashSet::new(),
+            globals: Vec::new(),
+            picker: None,
+            picker_closed: None,
             target_file: last_file().unwrap_or_else(|| DEFAULT_FILE.into()),
             current: None,
             yaml,
@@ -323,7 +349,7 @@ impl EditorView {
         let Some(ws) = &self.ws else { return };
         let listed = ws.list_snippets(None, None);
         let files = ws.list_files();
-        let base = ws.base().to_path_buf();
+        let globals = ws.global_vars();
         match listed {
             Ok(list) => {
                 self.all = list.snippets;
@@ -337,13 +363,10 @@ impl EditorView {
             let matches: Vec<_> = files.into_iter().filter(|f| f.kind == "match").collect();
             self.files = matches.iter().filter(|f| !f.read_only).map(|f| f.path.clone()).collect();
             self.match_files = matches.iter().map(|f| f.path.clone()).collect();
-            self.global_names = self
-                .match_files
-                .iter()
-                .filter_map(|f| std::fs::read_to_string(base.join(f)).ok())
-                .filter_map(|text| MatchFile::parse(&text).ok())
-                .flat_map(|m| m.global_vars.into_iter().map(|(name, _)| name))
-                .collect();
+        }
+        match globals {
+            Ok(g) => self.globals = g,
+            Err(e) => popup_core::log::line(&format!("editor: cannot load the global variables: {e}")),
         }
         cx.notify();
     }
@@ -589,8 +612,13 @@ impl EditorView {
             _subs: Vec::new(),
         });
         if let Some(i) = &mut self.inputs {
-            i._subs = subs.into_inner();
+            let mut subs = subs.into_inner();
+            // Caret moves notify the box, not the editor: the picker
+            // follows them here.
+            subs.push(cx.observe_in(&i.body, window, |this, _, window, cx| this.update_picker(window, cx)));
+            i._subs = subs;
         }
+        self.picker = None;
         self.form = Some(form);
         cx.notify();
     }
@@ -749,7 +777,7 @@ impl EditorView {
         let in_params = braces(&params.join("\n"));
         let mut out = Vec::new();
         for u in &body {
-            if !names.contains(u) && !self.global_names.contains(u) {
+            if !names.contains(u) && !self.globals.iter().any(|(g, _)| g == u) {
                 out.push(format!("{{{{{u}}}}} in the text has no variable here and no global variable."));
             }
         }
@@ -759,6 +787,129 @@ impl EditorView {
             }
         }
         out
+    }
+
+    /// The names of this snippet's variables, as the boxes hold them, each
+    /// once.
+    fn own_var_names(&self, cx: &App) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for v in self.inputs.iter().flat_map(|i| &i.vars) {
+            let n = v.name.read(cx).value().trim().to_string();
+            if !n.is_empty() && !out.contains(&n) {
+                out.push(n);
+            }
+        }
+        out
+    }
+
+    /// Whether the text box of this output takes `{{name}}`. A form uses
+    /// `[[field]]`, and an image path takes no variables.
+    fn takes_vars(&self) -> bool {
+        self.form.as_ref().is_some_and(|f| matches!(f.output.as_str(), "replace" | "markdown" | "html"))
+    }
+
+    /// Opens, updates or closes the `{{` picker after the text or the caret
+    /// of the text box changed.
+    fn update_picker(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let mut found = None;
+        if let Some(inputs) = self.inputs.as_ref().filter(|_| self.takes_vars()) {
+            let s = inputs.body.read(cx);
+            let range = s.selected_range();
+            if s.focus_handle(cx).is_focused(window) && range.is_empty() {
+                let text = s.value();
+                found = matchedit::open_braces(&text, range.end).map(|(start, typed)| (start, typed.to_string()));
+            }
+        }
+        if found.is_none() {
+            self.picker_closed = None;
+        }
+        let next = found.filter(|(start, _)| self.picker_closed != Some(*start));
+        let now = self.picker.as_ref().map(|p| (p.start, p.typed.clone()));
+        if next != now {
+            self.picker = next.map(|(start, typed)| Picker { start, typed, selected: 0 });
+            cx.notify();
+        }
+    }
+
+    /// The rows of the open picker.
+    fn picker_rows(&self, cx: &App) -> Vec<Pick> {
+        let Some(p) = &self.picker else { return Vec::new() };
+        pick_rows(&self.own_var_names(cx), &self.globals, &p.typed)
+    }
+
+    /// Moves the highlighted row of the picker by `step`, around the ends.
+    fn picker_step(&mut self, step: isize, cx: &mut Context<Self>) -> bool {
+        let n = self.picker_rows(cx).len() as isize;
+        let Some(p) = self.picker.as_mut().filter(|_| n > 0) else { return false };
+        p.selected = (p.selected as isize + step).rem_euclid(n) as usize;
+        cx.notify();
+        true
+    }
+
+    /// Inserts the highlighted row of the picker in place of the typed
+    /// `{{name`. False when the picker has no rows.
+    fn accept_pick(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(p) = &self.picker else { return false };
+        let Some(pick) = self.picker_rows(cx).get(p.selected).cloned() else { return false };
+        let start = p.start;
+        let Some(body) = self.inputs.as_ref().map(|i| i.body.clone()) else { return false };
+        let (text, caret) = {
+            let s = body.read(cx);
+            (s.value().to_string(), s.selected_range().end)
+        };
+        self.picker = None;
+        self.insert_pick(pick, matchedit::braces_span(&text, start, caret), window, cx);
+        true
+    }
+
+    /// Writes `{{name}}` over the bytes `span` of the text box, and puts
+    /// the caret after it. A new variable is added to the form first, with
+    /// a free name.
+    fn insert_pick(&mut self, pick: Pick, span: std::ops::Range<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(body) = self.inputs.as_ref().map(|i| i.body.clone()) else { return };
+        let name = match &pick {
+            Pick::Own(n) | Pick::Global(n, _) => n.clone(),
+            Pick::New(kind) => {
+                let mut taken = self.own_var_names(cx);
+                taken.extend(self.globals.iter().map(|(g, _)| g.clone()));
+                matchedit::free_var_name(kind, &taken)
+            }
+        };
+        let token = format!("{{{{{name}}}}}");
+        let caret = span.start + token.len();
+        match pick {
+            Pick::New(kind) => {
+                let text = body.read(cx).value().to_string();
+                let Some(new_text) = text.get(..span.start).zip(text.get(span.end..)).map(|(a, b)| format!("{a}{token}{b}"))
+                else {
+                    return;
+                };
+                // The form rebuilds every box: the text goes in with the
+                // new variable.
+                self.edit_form(window, cx, |f| {
+                    f.body = new_text;
+                    f.vars.push(matchedit::new_var(&name, kind));
+                });
+                if let Some(body) = self.inputs.as_ref().map(|i| i.body.clone()) {
+                    body.update(cx, |s, cx| {
+                        s.focus(window, cx);
+                        s.set_selected_range(caret..caret, cx);
+                    });
+                }
+            }
+            _ => body.update(cx, |s, cx| {
+                s.focus(window, cx);
+                s.set_selected_range(span, cx);
+                s.replace(token, window, cx);
+            }),
+        }
+        cx.notify();
+    }
+
+    /// Inserts a chip or a menu row over the selection of the text box.
+    fn insert_at_caret(&mut self, pick: Pick, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(span) = self.inputs.as_ref().map(|i| i.body.read(cx).selected_range()) else { return };
+        self.insert_pick(pick, span, window, cx);
     }
 
     fn delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -912,6 +1063,9 @@ impl EditorView {
     /// box. Returns false when the focus is not in a box of the order, so
     /// the key goes on (to the YAML box, for example).
     fn tab_move(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !back && self.picker.is_some() && self.accept_pick(window, cx) {
+            return true;
+        }
         let order = self.tab_order(cx);
         let Some(pos) = order.iter().position(|h| h.is_focused(window)) else { return false };
         let n = order.len();
@@ -1081,7 +1235,10 @@ impl EditorView {
                 this.area_heights.insert(drag_key.clone(), h);
                 cx.notify();
             }))
-            .child(Textarea::new(state).small().h(h))
+            // The text area paints lines past its bottom edge when its text
+            // is taller than the area. The clip keeps them off the controls
+            // below.
+            .child(div().h(h).overflow_hidden().child(Textarea::new(state).small().h_full()))
             .child(
                 div()
                     .id(SharedString::from(format!("resize-{key}")))
@@ -1249,22 +1406,14 @@ impl EditorView {
                 .into_any_element()
         });
         let vars: Vec<_> = vars.collect();
-        let add_var = icon("add-var".into(), IconName::Plus, "Add a variable").on_click(cx.listener(|this, _, window, cx| {
-            this.edit_form(window, cx, |f| {
-                let name = format!("var{}", f.vars.len() + 1);
-                f.vars.push(matchedit::new_var(&name, "shell"));
-            });
-        }));
         let var_hints = self.var_hints(cx);
         let variables = div()
             .flex()
             .flex_col()
             .gap_1()
+            .children(self.render_var_bar(theme, cx))
             .children(vars)
-            .children(Self::hints(theme, var_hints))
-            .child(div().flex().items_center().gap_1().child(add_var).when(form.vars.is_empty(), |d| {
-                d.child(div().text_sm().text_color(muted).child("Use a variable in the text as {{name}}."))
-            }));
+            .children(Self::hints(theme, var_hints));
 
         let others = (!form.other_keys.is_empty()).then(|| {
             div()
@@ -1280,11 +1429,207 @@ impl EditorView {
             .gap_2()
             .when(!has_regex, |d| d.child(row("Triggers", triggers.into_any_element())))
             .when(has_regex, |d| d.child(row("Regex", Input::new(&inputs.regex).small().into_any_element())))
-            .child(row(output_title(&form.output), self.resizable_area("body", 140.0, &inputs.body, theme, cx)))
+            .child(row(output_title(&form.output), self.render_body(theme, cx)))
             .child(row("Label", Input::new(&inputs.label).small().into_any_element()))
             .child(row("Variables", variables.into_any_element()))
             .children(others)
             .into_any_element()
+    }
+
+    /// The text box of the output, with the `{{` picker below it.
+    fn render_body(&self, theme: &component::Theme, cx: &mut Context<Self>) -> AnyElement {
+        let Some(inputs) = &self.inputs else { return div().into_any_element() };
+        let area = div()
+            .capture_action(cx.listener(|this, _: &input::MoveUp, _, cx| {
+                if this.picker_step(-1, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .capture_action(cx.listener(|this, _: &input::MoveDown, _, cx| {
+                if this.picker_step(1, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .capture_action(cx.listener(|this, _: &input::Enter, window, cx| {
+                if this.accept_pick(window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .capture_action(cx.listener(|this, _: &input::Escape, _, cx| {
+                if let Some(p) = this.picker.take() {
+                    this.picker_closed = Some(p.start);
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+            }))
+            .child(self.resizable_area("body", 140.0, &inputs.body, theme, cx));
+        div().flex().flex_col().gap_1().child(area).children(self.render_picker(theme, cx)).into_any_element()
+    }
+
+    /// The top line of the Variables row: the variables that the text can
+    /// use, one chip each, or one menu when there are many. A click inserts
+    /// `{{name}}` at the caret of the text box. The New menu makes a
+    /// variable and inserts it. An output without `{{name}}` (a form, an
+    /// image) shows only New, which then only adds the variable.
+    fn render_var_bar(&self, theme: &component::Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        const MAX_CHIPS: usize = 6;
+        let (Some(inputs), Some(form)) = (self.inputs.as_ref(), self.form.as_ref()) else { return None };
+        if !self.takes_vars() {
+            let view = cx.entity().downgrade();
+            let add = Button::new("vars-add")
+                .label("New")
+                .icon(IconName::Plus)
+                .ghost()
+                .xsmall()
+                .tooltip("Add a variable")
+                .dropdown_menu(move |menu, _, _| type_menu(menu, view.clone(), false));
+            return Some(div().flex().child(add).into_any_element());
+        }
+        let muted = theme.muted_foreground;
+        let own = self.own_var_names(cx);
+        let kind_of = |name: &str| {
+            inputs
+                .vars
+                .iter()
+                .position(|v| v.name.read(cx).value().trim() == name)
+                .and_then(|i| form.vars.get(i))
+                .map(|v| matchedit::var_get(v, &["type"]))
+                .unwrap_or_default()
+        };
+        let used = braces(&inputs.body.read(cx).value());
+        let picks: Vec<(Pick, String)> = own
+            .iter()
+            .map(|n| {
+                let kind = kind_of(n);
+                (Pick::Own(n.clone()), format!("{kind}: {}. Click to insert.", matchedit::var_help(&kind)))
+            })
+            .chain(self.globals.iter().filter(|(g, _)| !own.contains(g)).map(|(g, t)| {
+                (Pick::Global(g.clone(), t.clone()), format!("Global {t} variable: {}. Click to insert.", matchedit::var_help(t)))
+            }))
+            .collect();
+        let weak = cx.entity().downgrade();
+        let mut bar = div().flex().flex_wrap().items_center().gap_1();
+        if picks.len() <= MAX_CHIPS {
+            let mut global_seen = false;
+            for (i, (pick, tip)) in picks.into_iter().enumerate() {
+                let (name, global) = match &pick {
+                    Pick::Own(n) => (n.clone(), false),
+                    Pick::Global(n, _) => (n.clone(), true),
+                    Pick::New(_) => continue,
+                };
+                if global && !global_seen {
+                    global_seen = true;
+                    bar = bar.child(div().text_xs().text_color(muted).child("global:"));
+                }
+                let view = weak.clone();
+                let chip = Button::new(SharedString::from(format!("vchip-{i}")))
+                    .label(format!("{{{{{name}}}}}"))
+                    .xsmall()
+                    .tooltip(tip)
+                    .on_click(move |_, window, cx| {
+                        let pick = pick.clone();
+                        let _ = view.update(cx, |this, cx| this.insert_at_caret(pick, window, cx));
+                    });
+                // A variable of this snippet that the text does not use yet
+                // is dimmed.
+                bar = bar.child(if global || used.contains(&name) { chip.outline() } else { chip.ghost() });
+            }
+        } else {
+            let view = weak.clone();
+            let count = picks.len();
+            let menu = Button::new("vars-menu")
+                .label(format!("Variables ({count})"))
+                .icon(IconName::ChevronDown)
+                .outline()
+                .xsmall()
+                .dropdown_menu(move |mut menu, _, _| {
+                    let mut section = None;
+                    for (pick, _) in &picks {
+                        let (title, label) = match pick {
+                            Pick::Own(n) => ("This snippet", format!("{{{{{n}}}}}")),
+                            Pick::Global(n, t) => ("Global", format!("{{{{{n}}}}}    {t}")),
+                            Pick::New(_) => continue,
+                        };
+                        if section != Some(title) {
+                            if section.is_some() {
+                                menu = menu.separator();
+                            }
+                            menu = menu.label(title);
+                            section = Some(title);
+                        }
+                        let (view, pick) = (view.clone(), pick.clone());
+                        menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                            let pick = pick.clone();
+                            let _ = view.update(cx, |this, cx| this.insert_at_caret(pick, window, cx));
+                        }));
+                    }
+                    menu.max_h(px(320.0)).scrollable(true)
+                });
+            bar = bar.child(menu);
+        }
+        let add_view = weak.clone();
+        let add = Button::new("vars-add")
+            .label("New")
+            .icon(IconName::Plus)
+            .ghost()
+            .xsmall()
+            .tooltip("Make a new variable and insert it at the caret")
+            .dropdown_menu(move |menu, _, _| type_menu(menu, add_view.clone(), true));
+        Some(bar.child(add).child(div().text_xs().text_color(muted).child("Click to insert, or type {{ in the text")).into_any_element())
+    }
+
+    /// The `{{` picker: the variables that match the typed name, and new
+    /// variables by type. Up and Down move, Enter or Tab inserts, Esc closes.
+    fn render_picker(&self, theme: &component::Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let p = self.picker.as_ref()?;
+        let rows = self.picker_rows(cx);
+        if rows.is_empty() {
+            return None;
+        }
+        let muted = theme.muted_foreground;
+        let selected = p.selected.min(rows.len() - 1);
+        let items = rows.into_iter().enumerate().map(|(i, pick)| {
+            let (label, note) = match &pick {
+                Pick::Own(n) => (format!("{{{{{n}}}}}"), "this snippet".to_string()),
+                Pick::Global(n, t) => (format!("{{{{{n}}}}}"), format!("global {t}")),
+                Pick::New(t) => (format!("+ new {t}"), matchedit::var_help(t).to_string()),
+            };
+            div()
+                .id(SharedString::from(format!("pick-{i}")))
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .rounded_sm()
+                .text_sm()
+                .cursor_pointer()
+                .when(i == selected, |d| d.bg(theme.accent).text_color(theme.accent_foreground))
+                .child(div().flex_shrink_0().child(label))
+                .child(div().min_w_0().truncate().text_xs().text_color(muted).child(note))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        if let Some(p) = this.picker.as_mut() {
+                            p.selected = i;
+                        }
+                        this.accept_pick(window, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+        });
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .p_1()
+                .rounded_md()
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.popover)
+                .children(items)
+                .child(div().px_2().text_xs().text_color(muted).child("Up/Down move, Enter or Tab inserts, Esc closes"))
+                .into_any_element(),
+        )
     }
 
     /// The "More options" tab: the fields that few snippets use.
@@ -1617,6 +1962,52 @@ fn remember_file(file: &str) {
     write_setting(LAST_FILE, file);
 }
 
+/// The menu of variable types, each with its help line. A pick adds a
+/// variable of that type; with `insert`, it also inserts it at the caret.
+fn type_menu(mut menu: PopupMenu, view: WeakEntity<EditorView>, insert: bool) -> PopupMenu {
+    for (t, _) in VAR_TYPES {
+        let t: &'static str = t;
+        let view = view.clone();
+        let label = format!("{t}: {}", matchedit::var_help(t));
+        menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+            let _ = view.update(cx, |this, cx| {
+                if insert {
+                    this.insert_at_caret(Pick::New(t), window, cx);
+                } else {
+                    this.edit_form(window, cx, |f| {
+                        let taken: Vec<String> = f.vars.iter().map(|v| matchedit::var_get(v, &["name"])).collect();
+                        f.vars.push(matchedit::new_var(&matchedit::free_var_name(t, &taken), t));
+                    });
+                }
+            });
+        }));
+    }
+    menu
+}
+
+/// The rows of the `{{` picker for the name `typed` so far: this snippet's
+/// variables, then the global ones, then a new variable of each type. A
+/// name matches when it contains `typed`, ignoring case; names that start
+/// with it come first. A type matches when it starts with `typed`.
+fn pick_rows(own: &[String], globals: &[(String, String)], typed: &str) -> Vec<Pick> {
+    const MAX: usize = 12;
+    let typed = typed.to_lowercase();
+    let rank = |name: &str| {
+        let n = name.to_lowercase();
+        if n.starts_with(&typed) { Some(0) } else if n.contains(&typed) { Some(1) } else { None }
+    };
+    let mut vars: Vec<(u8, usize, Pick)> = own
+        .iter()
+        .map(|n| (rank(n), Pick::Own(n.clone())))
+        .chain(globals.iter().filter(|(g, _)| !own.contains(g)).map(|(g, t)| (rank(g), Pick::Global(g.clone(), t.clone()))))
+        .enumerate()
+        .filter_map(|(i, (r, p))| r.map(|r| (r, i, p)))
+        .collect();
+    vars.sort_by_key(|(r, i, _)| (*r, *i));
+    let new = VAR_TYPES.iter().map(|(t, _)| *t).filter(|t| *t != "global" && t.starts_with(&typed)).map(Pick::New);
+    vars.into_iter().map(|(_, _, p)| p).chain(new).take(MAX).collect()
+}
+
 /// The names in `{{name}}` and `{{name.field}}`, each once.
 fn braces(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -1717,5 +2108,32 @@ fn output_title(key: &str) -> &'static str {
         "image_path" => "Image path",
         "form" => "Form",
         _ => "Replace",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{pick_rows, Pick};
+
+    #[test]
+    fn picker_rows_put_own_and_prefix_matches_first() {
+        let own = vec!["name".to_string(), "surname".to_string()];
+        let globals = vec![("myname".to_string(), "echo".to_string()), ("name".to_string(), "echo".to_string())];
+        let rows = pick_rows(&own, &globals, "Na");
+        // Prefix matches first, a global with an own name is left out, and
+        // no type starts with "na".
+        assert_eq!(
+            rows,
+            vec![
+                Pick::Own("name".into()),
+                Pick::Own("surname".into()),
+                Pick::Global("myname".into(), "echo".into()),
+            ]
+        );
+        // "d" offers the date type as a new variable.
+        assert_eq!(pick_rows(&own, &globals, "d"), vec![Pick::New("date")]);
+        // An empty name lists everything, and never the global type.
+        let all = pick_rows(&[], &[], "");
+        assert!(all.contains(&Pick::New("shell")) && !all.contains(&Pick::New("global")));
     }
 }

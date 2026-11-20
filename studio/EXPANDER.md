@@ -120,6 +120,7 @@ snip waits instead:
 - If a key fits no longer trigger, the short trigger expands. The engine erases the trigger and the keys after it, and types the keys again after the text.
 - Changed on 2026-11-18: the wait has no time limit. An accept key expands the short trigger: Space, Tab or Enter without the popup, and Space in the popup. The hook swallows that key, so the application never gets it. For example, Enter after `,,gm` in a shell expands `,,gm` and does not run the line. `--prefix-wait-ms N` with N above 0 brings back the old rule: if no key comes in N ms, the short trigger expands.
 - The hook knows that a trigger waits from a flag that the engine sets after each key. The engine thread handles a key in well under a millisecond, so the flag is ready before the next key. If an accept key still comes after the wait ended, the engine types the key again.
+- `snipctl overlaps --own` lists each pair of your own triggers where one is the start of the other. Rename one side of a pair to remove the wait for it.
 - While the `;;` popup is open, the wait does not end by time, because the user picks in the popup. For example, `;;anki` shows `;;anki` and `;;anki2`, and neither expands on its own. The next key decides: Enter or Tab inserts the selected snippet, Space expands the short trigger, and a key that fits no longer trigger expands the short one. If the popup closes without a key, nothing expands.
 - Backspace erases a key after the trigger and keeps the wait. A Backspace on the trigger itself, an arrow key or a click ends the wait, and nothing expands.
 
@@ -174,6 +175,7 @@ Rules:
 - All paragraphs start checked. `snip: { pick: many, checked: none }` starts with none checked.
 - A snippet with only one paragraph inserts without a list.
 - In the `,,` popup, Caps Lock or Ctrl+P on a row inserts that snippet as a paragraph pick. Caps Lock then does not switch to capitals. This works for every snippet, with or without a `snip:` key. If the snippet sets `checked: none`, no paragraph starts checked. Else all paragraphs start checked. Added on 2026-11-19.
+- In the `,,` popup, Ctrl+Caps Lock on a row inserts that snippet as a text pick (a name of this project): a window shows the whole rendered text, and you select parts of it, Ctrl+drag for each further part. Enter inserts the parts in text order, one per line. Without a selection, Enter inserts nothing. Variables run before the window opens, because the text must be complete. The cursor hint (`$|$`) applies only when you insert the whole text. Added on 2026-11-19.
 - espanso ignores the `snip:` key and inserts the whole text. A bad value, for example `pick: one`, gives a `warning` in the log and in `snipctl validate`, and the snippet expands without a list.
 
 The list:
